@@ -5,6 +5,8 @@
    攻占/梭哈/拉线…，黑名单「虫子」跳过），取最新一条可执行指令的坐标作为战场
 2. **调动据点**：找离战场最近、且能「调动」的盟归属据点（同盟建筑 + 城池列表），
    逐支把 部队1-4 派过去（出征前读「兵力 N」，不满先点白色补兵，补完仍 <门槛就跳过）
+2.5 **低兵力歇兵**：补不满的部队在其他队伍调动成功后，送到附近城池自动征兵；
+   每轮发起调动前先把已征满的部队召回主城（`sanmou_auto/city_rest.py`）
 3. **寻找敌方进攻**：按邮件动作点 集结/攻占/行军 → 出征；邮件执行不了就在地图上找
    红色敌对目标，视野没有红敌则用「战报」绿色坐标；等战斗结束
 4. **回家补兵**：回城（城内视角）→ 亲卫营 → 逐队读「兵力 当前/上限」→ 不满就补兵
@@ -23,6 +25,7 @@
     python -m sanmou_auto.flow_mobilize --troops 1,2,3  # 只调动 1-3 队
     python -m sanmou_auto.flow_mobilize --no-battle     # 只调动 + 回家补兵
     python -m sanmou_auto.flow_mobilize --limit 10 --dry-run
+    python -m sanmou_auto.flow_mobilize --no-city-rest    # 关闭进城歇兵/召回
 """
 from __future__ import annotations
 
@@ -34,6 +37,7 @@ import time
 from . import cli, config, intent, vision
 from .adb import Adb
 from .alliance import NO_MOBILIZE_HINTS, AllianceFacilities, Camp
+from .city_rest import CityRest
 from .battle import BattleCommander, BattleFlow
 from .home import HomeReplenish
 from .mail import MailBody, MailReader
@@ -63,6 +67,7 @@ class MobilizeFlow:
         return mails
 
     def battlefield(self, mails: list[MailBody]):
+        """（见下方 docstring）"""
         """战场 = 最新一条白名单指令的坐标；返回 (坐标, 同战场指令, 代表邮件)。
 
         没有可执行指令时，只要邮件里带坐标也借用它作为战场坐标——
@@ -119,7 +124,8 @@ class MobilizeFlow:
             wait_return: bool = True, battle_timeout: float = 900.0,
             min_strength: int = STRENGTH_FULL, replenish: bool = True,
             enemy_fallback: bool = True, timer: StepTimer | None = None,
-            home: bool = True) -> dict:
+            home: bool = True, city_rest: bool = True,
+            city_rest_state: str | None = None) -> dict:
         # 调动范围固定为 1-4 队
         troops = tuple(int(t) for t in troops if 1 <= int(t) <= 4) or (1, 2, 3, 4)
         tm = timer or StepTimer()
@@ -127,6 +133,23 @@ class MobilizeFlow:
         tm.mark("连接设备", "准备", stage=STAGE_MAIL)
         self.nav.ensure_map()
         tm.mark("回到地图", "执行", stage=STAGE_MAIL)
+
+        fac = AllianceFacilities(self.adb, log=self.log)
+        rest = CityRest(self.adb, fac=fac, log=self.log, timer=tm,
+                        state_path=city_rest_state)
+        rest_recall: dict | None = None
+        if city_rest:
+            self.log("== 检查歇兵城池：把已征满的部队召回主城")
+            try:
+                rest_recall = rest.recall_ready()
+                self.log(f"  检查 {rest_recall.get('checked', 0)} 支，"
+                         f"召回 {len(rest_recall.get('recalled') or [])} 支，"
+                         f"仍在歇兵 {len(rest_recall.get('remaining') or [])} 支")
+            except Exception as e:  # 歇兵是增益功能，异常不阻断主线
+                rest_recall = {"ok": False, "reason": f"exception: {e}"}
+                self.log(f"  ! 歇兵召回异常：{e!r}")
+            tm.mark("召回歇兵部队", "执行", stage=STAGE_MOBILIZE)
+
         mails = self.read_mails(limit=limit)
         tm.mark("读取/解析邮件", "分析", stage=STAGE_MAIL)
         for m in mails:
@@ -151,8 +174,9 @@ class MobilizeFlow:
         result: dict = {"ok": False, "battlefield": coord,
                         "mails": len(mails), "group": len(group),
                         "troops": [int(t) for t in troops]}
+        if city_rest and rest_recall is not None:
+            result["city_rest_recall"] = _rest_summary(rest_recall)
 
-        fac = AllianceFacilities(self.adb, log=self.log)
         camp = self.locate_camp(fac, coord)
         tm.mark("定位最近可调动据点", "分析", stage=STAGE_MOBILIZE)
         if not camp:
@@ -180,12 +204,34 @@ class MobilizeFlow:
             result["elapsed"] = tm.elapsed
             return result
 
+        # 正在城池歇兵的部队本轮不参与据点调动（等征满召回后再参战）
+        active_troops = troops
+        if city_rest:
+            held = {e.troop for e in rest.entries()}
+            if held:
+                result["city_rest_held"] = sorted(held)
+                active_troops = tuple(t for t in troops if t not in held)
+                self.log(f"  · 部队{sorted(held)} 正在城池歇兵，本轮不参与据点调动")
+        if not active_troops:
+            self.log("× 所有要调动的部队都在城池歇兵，本轮只做收尾")
+            result["ok"] = False
+            result["reason"] = "all-troops-resting"
+            result["timing"] = tm.as_list()
+            result["timing_by_kind"] = tm.totals_by_kind()
+            result["timing_by_stage"] = tm.totals_by_stage()
+            result["elapsed"] = tm.elapsed
+            if home:
+                result["home_replenish"] = HomeReplenish(
+                    self.adb, log=self.log, timer=tm).run()
+                result["home_ok"] = bool(result["home_replenish"].get("ok"))
+            return result
+
         # 城池/港口出征成功后「调动」面板会自动收起，给它一个「重新选中据点」的回调
         mob = Mobilizer(self.adb, log=self.log,
                         reselect=lambda: fac.reselect(camp), timer=tm)
         # send_stationed=True：上一轮打完停在战场格子的部队（状态「停留」）
         # 也算可派，避免整轮因为 4 队都在「停留/调动」而 no-troop-dispatched
-        mr = mob.mobilize(indexes=troops, min_strength=min_strength,
+        mr = mob.mobilize(indexes=active_troops, min_strength=min_strength,
                           replenish=replenish, send_stationed=True)
         tm.mark("调动部队", "执行", stage=STAGE_MOBILIZE)
         mr.camp = camp.describe()
@@ -202,6 +248,23 @@ class MobilizeFlow:
             t.dispatched for t in mr.troops)
         result["failed_troops"] = [
             t.index for t in mr.troops if not t.dispatched]
+
+        # ---- 节点二点五：低兵力部队进城歇兵（城池自动征兵）----
+        if city_rest:
+            low = tuple(t.index for t in mr.troops
+                        if t.skipped_reason == "low-strength")
+            others = any(t.dispatched for t in mr.troops
+                         if t.index not in low and t.dispatched)
+            try:
+                send = rest.send_low_strength(low, coord, camp=camp,
+                                              allow_send=others)
+            except Exception as e:  # 可选增益，异常不阻断进攻
+                send = {"ok": False, "reason": f"exception: {e}"}
+                self.log(f"  ! 低兵力进城异常：{e!r}")
+            result["city_rest_send"] = _rest_summary(send)
+            if low:
+                result["low_strength_troops"] = list(low)
+            tm.mark("低兵部队进城歇兵", "执行", stage=STAGE_MOBILIZE)
 
         # ---- 节点三：寻找敌方进攻（邮件驱动 / 红色敌对兜底）----
         if battle and result["ok"]:
@@ -248,6 +311,15 @@ class MobilizeFlow:
         return result
 
 
+def _rest_summary(payload: dict | None) -> dict:
+    """把城市歇兵/召回结果裁成落盘用的精简结构。"""
+    if not isinstance(payload, dict):
+        return {}
+    keys = ("ok", "reason", "checked", "recalled", "pending", "dropped",
+            "remaining", "sent", "city", "statuses")
+    return {key: payload[key] for key in keys if key in payload}
+
+
 def main(argv: list[str] | None = None) -> int:
     cli.setup_console()
     ap = argparse.ArgumentParser(
@@ -271,6 +343,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="邮件执行不了时不去找红色敌对目标")
     ap.add_argument("--no-home", action="store_true",
                     help="结束后不回家补兵（直接在战场收尾）")
+    ap.add_argument("--no-city-rest", action="store_true",
+                    help="关闭「低兵力进城歇兵 / 征满召回」")
+    ap.add_argument("--city-rest-state", default="",
+                    help="歇兵状态文件（默认 screenshots/flow/city_rest.json）")
     args = ap.parse_args(argv)
 
     troops = tuple(int(t) for t in args.troops.split(",") if t.strip())
@@ -281,7 +357,9 @@ def main(argv: list[str] | None = None) -> int:
                    min_strength=args.min_strength,
                    replenish=not args.no_replenish,
                    enemy_fallback=not args.no_enemy_fallback,
-                   home=not args.no_home)
+                   home=not args.no_home,
+                   city_rest=not args.no_city_rest,
+                   city_rest_state=args.city_rest_state or None)
 
     print("\n===== 结果 =====")
     if not res.get("ok"):
@@ -316,6 +394,16 @@ def main(argv: list[str] | None = None) -> int:
     if isinstance(hr, dict):
         print(f"回家补兵：{'完成' if hr.get('ok') else '未完成'} "
               f"{hr.get('note') or hr.get('reason') or ''}")
+    cr = res.get("city_rest_recall")
+    if isinstance(cr, dict):
+        print(f"歇兵召回：检查 {cr.get('checked', 0)} 支，"
+              f"召回 {len(cr.get('recalled') or [])} 支，"
+              f"剩余 {len(cr.get('remaining') or [])} 支")
+    cs = res.get("city_rest_send")
+    if isinstance(cs, dict):
+        sent = [e.get("troop") for e in (cs.get("sent") or []) if isinstance(e, dict)]
+        print(f"歇兵进城：{'完成' if cs.get('ok') else '未执行'} "
+              f"{cs.get('city') or cs.get('reason') or ''} 部队 {sent}")
     st = res.get("timing_by_stage")
     if st:
         print("阶段耗时：" + " | ".join(f"{k} {v:.1f}s" for k, v in st.items()))

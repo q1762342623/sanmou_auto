@@ -1,6 +1,9 @@
 """功能「**自动拉线**」：循环执行
 「邮件分析战场 → 调动据点 → 寻找敌方进攻 → 回家补兵」，并统计每一轮每个节点耗时。
 
+低兵力部队会被送到附近城池自动征兵（`city_rest.py`），之后每轮调兵前把已征满的
+部队召回主城再参战；每轮输出会多一行「歇兵: 召回 x 支 | 本轮进城 [...]@城池」。
+
 停止条件（满足任一即停）：
 1. 到达运行时长（默认 1 小时，`--minutes` / `--seconds`）；
 2. **无法再补满兵力**：4 支部队全部「补兵后仍 < 满编」被跳过；
@@ -23,6 +26,7 @@
     python -m sanmou_auto.flow_loop --max-rounds 1      # 冒烟一轮
     python -m sanmou_auto.flow_loop --no-wait           # 不等战斗结束
     python -m sanmou_auto.flow_loop --no-home           # 不回家补兵
+    python -m sanmou_auto.flow_loop --no-city-rest      # 关闭进城歇兵/召回
 """
 from __future__ import annotations
 
@@ -187,6 +191,21 @@ def _print_round(i: int, started: str, wall: float,
     line = _troop_line(res)
     if line:
         print("    部队: " + line)
+    cr = res.get("city_rest_recall") or {}
+    cs = res.get("city_rest_send") or {}
+    if cr.get("recalled") or cr.get("remaining") or cs.get("sent"):
+        parts = []
+        if cr:
+            parts.append(f"召回 {len(cr.get('recalled') or [])} 支")
+        if cr.get("remaining"):
+            parts.append(f"歇兵中 {len(cr.get('remaining') or [])} 支")
+        if cs.get("sent"):
+            parts.append(f"本轮进城 {[e.get('troop') for e in cs.get('sent') or []
+                                        if isinstance(e, dict)]}"
+                         f"@{cs.get('city') or '-'}")
+        elif cs.get("reason"):
+            parts.append(f"进城未执行({cs.get('reason')})")
+        print("    歇兵: " + " | ".join(parts))
 
 
 def _print_summary(rounds: list[dict], wall_total: float, out_path: str) -> None:
@@ -241,7 +260,9 @@ class MobilizeLoop:
             enemy_fallback: bool = True, dry_run: bool = False,
             gap: float = 5.0, max_rounds: int = 0,
             stop_on_no_strength: bool = True,
-            max_fails: int = 5, home: bool = True) -> dict:
+            max_fails: int = 5, home: bool = True,
+            city_rest: bool = True,
+            city_rest_state: str | None = None) -> dict:
         self.adb.ensure_online()
         tag = time.strftime("%Y%m%d_%H%M%S")
         out_path = vision.shot_path(f"auto_line_{tag}.json")
@@ -276,7 +297,8 @@ class MobilizeLoop:
                         battle=battle, wait_return=wait_return,
                         battle_timeout=battle_timeout,
                         min_strength=min_strength, replenish=replenish,
-                        enemy_fallback=enemy_fallback, timer=tm, home=home)
+                        enemy_fallback=enemy_fallback, timer=tm, home=home,
+                        city_rest=city_rest, city_rest_state=city_rest_state)
                     error = ""
                     fails = 0
                 except Exception as e:                  # 单轮异常不终止长跑
@@ -303,6 +325,8 @@ class MobilizeLoop:
                     "camp": res.get("camp"),
                     "last_arrival": res.get("last_arrival"),
                     "troops": res.get("troops"),
+                    "city_rest_recall": res.get("city_rest_recall"),
+                    "city_rest_send": res.get("city_rest_send"),
                     "home_ok": res.get("home_ok"),
                     "home_replenish": res.get("home_replenish"),
                     "by_kind": by_kind,
@@ -392,6 +416,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="不执行「回家补兵」节点")
     ap.add_argument("--no-strength-stop", action="store_true",
                     help="4 队都补不满兵力也不停止（继续跑满时长）")
+    ap.add_argument("--no-city-rest", action="store_true",
+                    help="关闭「低兵力进城歇兵 / 征满召回」")
+    ap.add_argument("--city-rest-state", default="",
+                    help="歇兵状态文件（默认 screenshots/flow/city_rest.json）")
     args = ap.parse_args(argv)
 
     duration = args.seconds if args.seconds is not None else args.minutes * 60.0
@@ -405,7 +433,9 @@ def main(argv: list[str] | None = None) -> int:
         enemy_fallback=not args.no_enemy_fallback,
         gap=args.gap, max_rounds=args.max_rounds,
         stop_on_no_strength=not args.no_strength_stop,
-        max_fails=args.max_fails, home=not args.no_home)
+        max_fails=args.max_fails, home=not args.no_home,
+        city_rest=not args.no_city_rest,
+        city_rest_state=args.city_rest_state or None)
     return 0 if out.get("summary", {}).get("ok") else 1
 
 
