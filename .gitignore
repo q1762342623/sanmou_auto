@@ -1,0 +1,17 @@
+# Python 运行产物
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# 本地运行输出（截图、日志、跑批结果不随本仓库提交）
+screenshots/
+*.log
+*.jsonl
+
+# 编辑器/系统
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
