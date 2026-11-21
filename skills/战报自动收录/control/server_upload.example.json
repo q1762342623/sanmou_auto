@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "baseUrl": "http://127.0.0.1:8080",
+  "secretFile": "server_upload_secret.txt",
+  "timeoutSeconds": 120,
+  "maxBatchBytes": 33554432,
+  "maxBatchFiles": 500
+}

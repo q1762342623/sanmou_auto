@@ -1,0 +1,13 @@
+# 本机配置（复制 config.example.json 后改名）
+config.json
+
+# 运行产物与敏感数据
+captures/
+work/
+control/server_upload.json
+control/server_upload_secret.txt
+control/mumu_*.json
+
+# Python
+__pycache__/
+*.py[cod]

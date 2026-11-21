@@ -1,0 +1,76 @@
+{
+  "schemaVersion": 2,
+  "timezone": "Asia/Shanghai",
+  "eras": [
+    {
+      "eraId": "2026-08-01-stable-lineup",
+      "startedAt": "2026-08-01T00:00:00+08:00",
+      "reason": "Lineups entered a stable period; cumulative statistics reset to August 1"
+    },
+    {
+      "eraId": "2026-08-05-stage-buff",
+      "startedAt": "2026-08-05T12:00:00+08:00",
+      "reason": "A new game stage grants hero buffs; cumulative statistics restart at the mechanics boundary"
+    },
+    {
+      "eraId": "2026-08-06-130000-reset",
+      "startedAt": "2026-08-06T13:00:00+08:00",
+      "reason": "Manual cumulative statistics reset scheduled from the local tool"
+    },
+    {
+      "eraId": "2026-09-16-233022-reset",
+      "startedAt": "2026-09-16T23:30:22+08:00",
+      "reason": "User confirmed major game update is effective now; restart cumulative statistics for newly available heroes and skills."
+    },
+    {
+      "eraId": "2026-09-18-182326-reset",
+      "startedAt": "2026-09-18T18:23:26+08:00",
+      "reason": "Game minor version changed lineups; restart cumulative statistics from now"
+    },
+    {
+      "eraId": "2026-09-23-174508-reset",
+      "startedAt": "2026-09-23T17:45:08+08:00",
+      "reason": "User requested a fresh cumulative statistics reset from the current game version"
+    },
+    {
+      "eraId": "2026-10-05-143538-reset",
+      "startedAt": "2026-10-05T14:35:38+08:00",
+      "reason": "User requested a fresh cumulative statistics reset from the current time"
+    },
+    {
+      "eraId": "2026-11-12-012500-reset",
+      "startedAt": "2026-11-12T01:25:00+08:00",
+      "reason": "Manual cumulative statistics reset scheduled from the local tool"
+    },
+    {
+      "eraId": "2026-11-12-130000-reset",
+      "startedAt": "2026-11-12T13:00:00+08:00",
+      "reason": "Manual cumulative statistics reset scheduled from the local tool"
+    },
+    {
+      "eraId": "2026-11-15-090000-reset",
+      "startedAt": "2026-11-15T09:00:00+08:00",
+      "reason": "User scheduled a full cumulative statistics reset for 2026-11-15 09:00 Beijing time"
+    },
+    {
+      "eraId": "2026-11-18-121000-reset",
+      "startedAt": "2026-11-18T12:10:00+08:00",
+      "reason": "远端服务器战报清空（12:10）"
+    },
+    {
+      "eraId": "2026-11-18-121500-reset",
+      "startedAt": "2026-11-18T12:15:00+08:00",
+      "reason": "Manual cumulative statistics reset scheduled from the local tool"
+    },
+    {
+      "eraId": "2026-11-20-010000-reset",
+      "startedAt": "2026-11-20T01:00:00+08:00",
+      "reason": "远端服务器战报清空（2026-11-20 01:00）"
+    },
+    {
+      "eraId": "2026-11-21-173000-reset",
+      "startedAt": "2026-11-21T17:30:00+08:00",
+      "reason": "远端服务器战报清空（2026-11-21 17:30）"
+    }
+  ]
+}

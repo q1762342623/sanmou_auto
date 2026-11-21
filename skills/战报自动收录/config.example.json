@@ -1,0 +1,48 @@
+{
+  "adbPath": "C:\\Program Files\\Netease\\MuMu\\nx_main\\adb.exe",
+  "serial": "127.0.0.1:16416",
+  "package": "com.bilibili.nslg",
+  "python": "",
+  "screen": { "width": 1600, "height": 900 },
+  "targets": {
+    "reportEntry": [0.215, 0.814],
+    "allianceTab": [0.769, 0.118],
+    "combatTab": [0.3375, 0.118],
+    "pageBack": [0.056, 0.028],
+    "tabBand": [0.0, 0.075, 1.0, 0.165],
+    "swipe": { "x": 0.36, "y1": 0.72, "y2": 0.39, "durationMs": 700 }
+  },
+  "expand": {
+    "roiX1": 0.9,
+    "roiX2": 1.0,
+    "roiY1": 0.08,
+    "roiY2": 0.96,
+    "templateScale": 0.9,
+    "downThreshold": 0.85,
+    "minMargin": 0.1,
+    "minWidth": 14,
+    "maxWidth": 90,
+    "minHeight": 150,
+    "maxPerPage": 6,
+    "settleMs": 420
+  },
+  "ports": { "fallback": [20020, 20050, 20060, 20090], "min": 10000, "max": 65535 },
+  "capture": {
+    "pageDelayMs": 900,
+    "swipeDelayMs": 700,
+    "maxPages": 60,
+    "stalledPagesToStop": 2,
+    "visualDiffMean": 3.0,
+    "changedRatio": 0.03,
+    "navigateRetries": 3,
+    "tabsTimeoutMs": 4000,
+    "forceReload": true
+  },
+  "report": { "reportEra": "auto", "label": "sanmou-auto-war-report" },
+  "server": {
+    "configPath": "control/server_upload.json",
+    "baseUrl": "",
+    "waitVisibleSeconds": 180,
+    "pollSeconds": 5
+  }
+}

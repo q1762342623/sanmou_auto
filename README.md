@@ -42,7 +42,7 @@ skills/sanmou-email-rally/
 | 功能二：最近 10 条同盟邮件 → 战场 → 最近可调动据点（大营/城/水寨/军港/民港）→ 调动 部队1-4 → 记录最后到达时间 | ✅ 实测通过（2026-11-20） | `skills/sanmou-email-rally/SKILL.md` §1–5 | `python -m sanmou_auto.flow_mobilize` |
 | 功能三：调动前兵力检查（不满点白色补兵，补后仍 <30000 跳过该队）+ 到达后按邮件 集结/攻占/行军；邮件不可执行时先找红色敌对目标，视野无红敌则用「战报」绿色坐标 → 攻城；处理「未携带满战法」确认框；打完回据点 → 回城 | ✅ 实测通过（2026-11-21 14:06，4 队出征→返回→回城） | `skills/sanmou-email-rally/SKILL.md` §4.4–4.6 | `python -m sanmou_auto.flow_mobilize`（默认含战斗） |
 | **自动拉线**：循环「邮件分析战场 → 调动据点 → 寻找敌方进攻 → 回家补兵」，统计每轮每个节点耗时；据点列表跨轮缓存（省掉每轮 ≈340s 的同盟列表扫描） | ✅ 实测通过（2026-11-21，单轮 + 1 小时长跑见 [`docs/自动拉线.md`](docs/自动拉线.md)） | — | `python -m sanmou_auto.flow_loop` |
-| **战报自动收录**：进「战报→同盟→交战」→ 逐卡展开 + 滑到底（adb 触控），同时设备内 tcpdump 抓游戏流量 → pcap 解出 BLOB → 增量 HMAC 上传报表服务器 → 等 `/api/live` 可见；1600x900 横屏实测（3 页 / 6 BLOB / 34 条记录，29s 一轮） | ✅ 实测通过（2026-11-21，ingestVersion 10414） | [`../skills/战报自动收录/SKILL.md`](../skills/战报自动收录/SKILL.md) | `python ../skills/战报自动收录/scripts/round.py` |
+| **战报自动收录**：进「战报→同盟→交战」→ 逐卡展开 + 滑到底（adb 触控），同时设备内 tcpdump 抓游戏流量 → pcap 解出 BLOB → 增量 HMAC 上传报表服务器 → 等 `/api/live` 可见；1600x900 横屏实测（3 页 / 6 BLOB / 34 条记录，29s 一轮） | ✅ 实测通过（2026-11-21，ingestVersion 10414） | [`skills/战报自动收录/SKILL.md`](skills/战报自动收录/SKILL.md) | `python skills/战报自动收录/scripts/round.py` |
 
 ### 环境依赖
 

@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "reportSchemaVersion": 16,
+  "reportCardKeyVersion": 2,
+  "liveIndexSchemaVersion": 3,
+  "scanAnchorSchemaVersion": 3,
+  "captureMetadataSchemaVersion": 2,
+  "roundHistorySchemaVersion": 1,
+  "minimumScanAnchorGroups": 3
+}
