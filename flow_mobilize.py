@@ -34,7 +34,7 @@ import json
 import math
 import time
 
-from . import cli, config, intent, vision
+from . import camp_cache, cli, config, intent, vision
 from .adb import Adb
 from .alliance import NO_MOBILIZE_HINTS, AllianceFacilities, Camp
 from .city_rest import CityRest
@@ -43,10 +43,11 @@ from .home import HomeReplenish
 from .mail import MailBody, MailReader
 from .mapnav import MapNav
 from .mobilize import STRENGTH_FULL, Mobilizer
+from .sandbox import SandboxJump
 from .timing import STAGE_MAIL, STAGE_MOBILIZE, StepTimer
 
 CLUSTER_RADIUS = 6      # 判定“同一个战场”的坐标距离（格）
-CAMP_CACHE_RADIUS = 60  # 战场移动不超过该距离时复用上一轮的据点列表（避免重复扫描）
+CAMP_CACHE_TRY = 6      # 每轮最多用缓存校验几个候选据点（按距离由近到远）
 
 
 class MobilizeFlow:
@@ -55,9 +56,10 @@ class MobilizeFlow:
         self.reader = MailReader(self.adb, log=log)
         self.nav = MapNav(self.adb, log=log)
         self.log = log
-        # 据点列表缓存：{(Camp…)} + 当时扫描的战场坐标
+        # 据点全量快照：启动时从 screenshots/flow/camp_cache.json 载入，
+        # 之后每轮只做「选点 + 有没有调动按钮」的校验，不再重复扫描。
         self._camps: list[Camp] = []
-        self._camps_at: tuple[int, int] | None = None
+        self._camps_loaded = False
 
     # ------------------------------------------------------------------
     def read_mails(self, limit: int = 10, tabs: tuple[str, ...] = ("同盟",)):
@@ -95,25 +97,119 @@ class MobilizeFlow:
         return None, [], None
 
     # ------------------------------------------------------------------
+    def camps(self) -> list[Camp]:
+        """当前据点全量快照（供歇兵选城等复用，避免各自再扫一次）。"""
+        return self._load_camps()
+
+    def _load_camps(self) -> list[Camp]:
+        """读据点缓存（只读磁盘一次）；没有缓存时返回空列表。"""
+        if self._camps_loaded:
+            return self._camps
+        self._camps_loaded = True
+        camps, meta = camp_cache.load_camps()
+        if camps:
+            self._camps = camps
+            self.log(f"== 载入据点缓存 {len(camps)} 个"
+                     f"（{meta.get('scannedAtIso') or '-'}"
+                     f"{'，已超 6h 建议重扫' if meta.get('stale') else ''}）")
+        return self._camps
+
+    def _sandbox_locate(self, fac: AllianceFacilities,
+                        coord: tuple[int, int]) -> Camp | None:
+        """沙盘快跳：按距离取缓存候选据点，逐个「缩放→坐标→前往→点中心」。
+
+        注意不能直接跳战场格：战场格多半是敌方/中立地块（如 663,754 的建业台），
+        右侧只有「攻城」没有「调动」。要跳的是**己方可调动据点的坐标**。
+        实测单次 ~15~20s（含 2~3 次捏合）；失败候选立即从缓存剔除并试下一个，
+        最多试 2 个，之后交给原有缓存/列表链路兜底。
+        """
+        camps = self._load_camps()
+        if not camps:
+            return None
+        ordered = camp_cache.sort_by_distance(camps, coord)
+        # 上一轮成功过的据点排最前：战场通常就在附近，一次命中概率很高。
+        last_ok = camp_cache.get_last_ok()
+        if last_ok:
+            ordered.sort(key=lambda c: 0 if tuple(c.coord) == tuple(last_ok) else 1)
+        # 候选最多试 3 个；每次沙盘跳内部还有 4 次坐标校验重试。
+        for c in ordered[:3]:
+            try:
+                sb = SandboxJump(self.adb, log=self.log)
+                if not sb.goto((int(c.coord[0]), int(c.coord[1]))):
+                    self.log("  ! 没能进入沙盘页，回退缓存/列表定位")
+                    return None
+                if fac.has_mobilize_button():
+                    self.log(f"== 沙盘快跳命中：{c.describe()}"
+                             f"（距目标 {c.dist(coord):.1f}）")
+                    camp_cache.set_last_ok(c.coord)
+                    return c
+                self.log(f"  ! ({c.coord[0]},{c.coord[1]}) 跳转后没有「调动」→ 剔除缓存")
+                camp_cache.invalidate(c.coord)
+                self._camps = [x for x in self._camps
+                               if tuple(x.coord) != tuple(c.coord)]
+            except Exception as e:  # noqa: BLE001 - 快路径失败不阻断主链路
+                self.log(f"  ! 沙盘快跳异常：{e!r}")
+                return None
+        return None
+
+    def _reselect_camp(self, fac: AllianceFacilities, camp: Camp) -> bool:
+        """出征后「调动」面板自动收起时重开：优先沙盘重跳，失败再走列表重选。"""
+        try:
+            sb = SandboxJump(self.adb, log=self.log)
+            sb.goto((int(camp.coord[0]), int(camp.coord[1])), tries=4)
+            if fac.has_mobilize_button():
+                self.log(f"  ✓ 沙盘重跳回 {camp.describe()}")
+                camp_cache.set_last_ok(camp.coord)
+                return True
+        except Exception as e:  # noqa: BLE001
+            self.log(f"  ! 沙盘重跳异常：{e!r}")
+        return fac.reselect(camp)
+
     def locate_camp(self, fac: AllianceFacilities,
                     coord: tuple[int, int]) -> Camp | None:
-        """找最近可调动据点：优先复用上一轮的据点列表，避免每轮重扫 5 分钟。"""
-        if (self._camps and self._camps_at is not None
-                and math.dist(coord, self._camps_at) <= CAMP_CACHE_RADIUS):
-            ordered = sorted(self._camps, key=lambda c: c.dist(coord))
-            for c in ordered[:2]:
-                self.log(f"  · 复用缓存候选 {c.describe()} 距目标 {c.dist(coord):.1f}")
-                if fac.select(c) and fac.has_mobilize_button():
+        """找最近可调动据点：**先查缓存，全部失效才重扫**。
+
+        旧实现只在「战场移动 ≤60 格」时复用内存缓存、且只试最近 2 个候选，
+        一旦候选被占 / 没有「调动」按钮就退回全量扫描（单轮 2~5 分钟）。
+        现在改为「一次全量查询 + 持久化缓存」：
+        1. 启动后第一次调动前扫一次全量据点，写入 camp_cache.json；
+        2. 之后每轮按距离由近到远校验候选（选点 + 是否有「调动」），命中即用；
+        3. 校验失败的据点立即从缓存剔除，只有全部候选都不可用才重扫并覆盖缓存。
+        """
+        # 快路径：沙盘坐标直跳（~10~15s），命中就不用再进同盟列表逐屏 OCR。
+        camp = self._sandbox_locate(fac, coord)
+        if camp is not None:
+            return camp
+
+        camps = self._load_camps()
+        if camps:
+            cands = camp_cache.sort_by_distance(camps, coord)[:CAMP_CACHE_TRY]
+            for i, c in enumerate(cands):
+                self.log(f"  · 缓存候选 {c.describe()} 距目标 {c.dist(coord):.1f}")
+                # select() 返回 True 就代表跳转后已校验到「调动」按钮，
+                # 不再重复调 has_mobilize_button()（整屏按钮 OCR，一次 5~10s）。
+                # 只有最后一个候选才允许「回顶全表重扫」，避免单个失效据点
+                # 拖掉 2~5 分钟（实测 378s 就是这么来的）。
+                if fac.select(c, full_scan=(i == len(cands) - 1)):
                     self.log(f"== 最近可调动据点（缓存命中）：{c.describe()}"
                              f"（距目标 {c.dist(coord):.1f}）")
                     return c
-            self.log("  · 缓存候选都选不中，重新扫描同盟据点")
+                self.log(f"  ! 据点 {c.coord} 选不中或没有「调动」→ 从缓存剔除")
+                camp_cache.invalidate(c.coord)
+                self._camps = [x for x in self._camps
+                               if tuple(x.coord) != tuple(c.coord)]
+            self.log("  · 缓存候选全部不可用，重新扫描同盟据点")
+        else:
+            self.log("  · 没有据点缓存，先全量扫描一次（后续复用）")
 
         camps = fac.scan_all()
         camps = [c for c in camps
                  if not any(h in c.note for h in NO_MOBILIZE_HINTS)]
         self._camps = camps
-        self._camps_at = coord
+        self._camps_loaded = True
+        if camps:
+            path = camp_cache.save_camps(camps, battlefield=coord)
+            self.log(f"  · 据点缓存已更新：{len(camps)} 个 → {path}")
         if not camps:
             return None
         return fac.goto_nearest(coord, camps=camps)
@@ -125,7 +221,11 @@ class MobilizeFlow:
             min_strength: int = STRENGTH_FULL, replenish: bool = True,
             enemy_fallback: bool = True, timer: StepTimer | None = None,
             home: bool = True, city_rest: bool = True,
-            city_rest_state: str | None = None) -> dict:
+            city_rest_state: str | None = None,
+            wait_hook=None, safe_point=None) -> dict:
+        """`wait_hook(seconds)`：等待阶段分片回调（自动拉线据此插入战报收集）；
+        `safe_point(reason)`：世界地图上的节点边界回调（超时未收集时补一次）。
+        """
         # 调动范围固定为 1-4 队
         troops = tuple(int(t) for t in troops if 1 <= int(t) <= 4) or (1, 2, 3, 4)
         tm = timer or StepTimer()
@@ -133,6 +233,8 @@ class MobilizeFlow:
         tm.mark("连接设备", "准备", stage=STAGE_MAIL)
         self.nav.ensure_map()
         tm.mark("回到地图", "执行", stage=STAGE_MAIL)
+        if safe_point is not None:
+            safe_point("本轮开始")
 
         fac = AllianceFacilities(self.adb, log=self.log)
         rest = CityRest(self.adb, fac=fac, log=self.log, timer=tm,
@@ -152,6 +254,8 @@ class MobilizeFlow:
 
         mails = self.read_mails(limit=limit)
         tm.mark("读取/解析邮件", "分析", stage=STAGE_MAIL)
+        if safe_point is not None:
+            safe_point("邮件读完")
         for m in mails:
             self.log("   - " + (m.intent.describe() if m.intent else m.title))
 
@@ -204,18 +308,22 @@ class MobilizeFlow:
             result["elapsed"] = tm.elapsed
             return result
 
-        # 正在城池歇兵的部队本轮不参与据点调动（等征满召回后再参战）
+        # 歇兵登记只代表「这队之前兵力不足被送进城」，不能整轮踢出参战池：
+        # 召回经常失败（竖屏找不到撤回按钮），而其中可能已有征满的部队。
+        # 按要求「1-4 谁有兵谁出战」——照常把全部部队交给 mobilize，
+        # 由 ensure_strength 单队判定：达标/可补满就出征，否则只跳过这一队。
         active_troops = troops
         if city_rest:
             held = {e.troop for e in rest.entries()}
-            if held:
-                result["city_rest_held"] = sorted(held)
-                active_troops = tuple(t for t in troops if t not in held)
-                self.log(f"  · 部队{sorted(held)} 正在城池歇兵，本轮不参与据点调动")
+            resting = sorted(t for t in held if t in troops)
+            if resting:
+                result["city_rest_held"] = resting
+                self.log(f"  · 部队{resting} 仍在城池歇兵：本轮照常尝试，"
+                         "兵力达标且可派就出征，否则只跳过该队")
         if not active_troops:
-            self.log("× 所有要调动的部队都在城池歇兵，本轮只做收尾")
+            self.log("× 没有要调动的部队，本轮只做收尾")
             result["ok"] = False
-            result["reason"] = "all-troops-resting"
+            result["reason"] = "no-troops-requested"
             result["timing"] = tm.as_list()
             result["timing_by_kind"] = tm.totals_by_kind()
             result["timing_by_stage"] = tm.totals_by_stage()
@@ -228,7 +336,7 @@ class MobilizeFlow:
 
         # 城池/港口出征成功后「调动」面板会自动收起，给它一个「重新选中据点」的回调
         mob = Mobilizer(self.adb, log=self.log,
-                        reselect=lambda: fac.reselect(camp), timer=tm)
+                        reselect=lambda: self._reselect_camp(fac, camp), timer=tm)
         # send_stationed=True：上一轮打完停在战场格子的部队（状态「停留」）
         # 也算可派，避免整轮因为 4 队都在「停留/调动」而 no-troop-dispatched
         mr = mob.mobilize(indexes=active_troops, min_strength=min_strength,
@@ -239,6 +347,8 @@ class MobilizeFlow:
         mob.close()
         shots.append(self.nav.shoot(f"n3_完成_{time.strftime('%H%M%S')}"))
         tm.mark("关闭面板/截图", "执行", stage=STAGE_MOBILIZE)
+        if safe_point is not None:
+            safe_point("调动结束")
 
         result.pop("troops", None)      # 先丢掉请求参数里的序号列表，避免覆盖明细
         result.update(mr.as_dict())
@@ -257,7 +367,7 @@ class MobilizeFlow:
                          if t.index not in low and t.dispatched)
             try:
                 send = rest.send_low_strength(low, coord, camp=camp,
-                                              allow_send=others)
+                                              allow_send=others, camps=self.camps())
             except Exception as e:  # 可选增益，异常不阻断进攻
                 send = {"ok": False, "reason": f"exception: {e}"}
                 self.log(f"  ! 低兵力进城异常：{e!r}")
@@ -273,7 +383,7 @@ class MobilizeFlow:
                 camp=camp, mail=head, fac=fac, indexes=troops,
                 min_strength=min_strength, replenish=replenish,
                 wait_return=wait_return, timeout=battle_timeout,
-                enemy_fallback=enemy_fallback)
+                enemy_fallback=enemy_fallback, wait_hook=wait_hook)
             shots.extend(bt.get("shots", []))
             result["battle"] = {k: v for k, v in bt.items() if k != "shots"}
             result["mode"] = "mobilize+battle"
@@ -284,6 +394,8 @@ class MobilizeFlow:
             self.log("× 调动阶段没有部队可用，跳过敌方进攻")
             result["battle"] = {"ok": False, "reason": "no-troop-dispatched"}
             result["ok"] = False
+        if safe_point is not None:
+            safe_point("战斗结束")
 
         # ---- 节点四：回家补兵 ----
         if home:
@@ -297,6 +409,8 @@ class MobilizeFlow:
             result["home_ok"] = bool(hr.get("ok"))
             if not hr.get("ok"):
                 result["reason"] = (result.get("reason") or "") + "+home-failed"
+            if safe_point is not None:
+                safe_point("回家补兵结束")
 
         result["timing"] = tm.as_list()
         result["timing_by_kind"] = tm.totals_by_kind()

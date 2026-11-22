@@ -10,30 +10,48 @@
     "combatTab": [0.3375, 0.118],
     "pageBack": [0.056, 0.028],
     "tabBand": [0.0, 0.075, 1.0, 0.165],
-    "swipe": { "x": 0.36, "y1": 0.72, "y2": 0.39, "durationMs": 700 }
+    "swipe": { "x": 0.36, "y1": 0.78, "y2": 0.515, "durationMs": 760 }
   },
   "expand": {
     "roiX1": 0.9,
     "roiX2": 1.0,
     "roiY1": 0.08,
     "roiY2": 0.96,
+    "rightEdgeRatio": 0.945,
     "templateScale": 0.9,
     "downThreshold": 0.85,
     "minMargin": 0.1,
     "minWidth": 14,
-    "maxWidth": 90,
+    "maxWidth": 56,
     "minHeight": 150,
+    "maxHeight": 240,
+    "clickBottomInset": 26,
     "maxPerPage": 6,
-    "settleMs": 420
+    "settleMs": 700,
+    "retryTries": 1,
+    "maxRecoveriesPerPage": 2,
+    "bottomSafeRatio": 0.955,
+    "cutRatio": 0.97,
+    "finalSettleMs": 350
   },
   "ports": { "fallback": [20020, 20050, 20060, 20090], "min": 10000, "max": 65535 },
   "capture": {
     "pageDelayMs": 900,
     "swipeDelayMs": 700,
-    "maxPages": 60,
+    "maxPages": 0,
+    "hardMaxPages": 500,
     "stalledPagesToStop": 2,
+    "stalledProbeDelayMs": 1500,
+    "swipeRetryY1": 0.84,
+    "swipeRetryY2": 0.6,
+    "swipeRetryDurationMs": 800,
+    "requireListEnd": false,
     "visualDiffMean": 3.0,
     "changedRatio": 0.03,
+    "stableTimeoutMs": 2600,
+    "stableIntervalMs": 180,
+    "stableDiffMean": 0.9,
+    "stableChangedRatio": 0.002,
     "navigateRetries": 3,
     "tabsTimeoutMs": 4000,
     "forceReload": true
@@ -42,7 +60,7 @@
   "server": {
     "configPath": "control/server_upload.json",
     "baseUrl": "",
-    "waitVisibleSeconds": 180,
+    "waitVisibleSeconds": 900,
     "pollSeconds": 5
   }
 }

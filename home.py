@@ -27,46 +27,54 @@ import json
 import re
 import time
 
-from . import cli, ocrengine, vision
+from . import cli, config, ocrengine, vision
 from .adb import Adb
 from .mapnav import CITY_EXIT_POINTS, MapNav
 from .timing import STAGE_HOME
 
 # 城内「亲卫营」标签（OCR 兜底用固定点；场景固定，位置稳定）
-QINWEI_LABEL_BOX = (1000, 170, 1600, 360)
-QINWEI_ENTRY = (1298, 290)
+# 注意：2026-11-22 之前这里只有横屏坐标，竖屏会去 (1298,290) 点到屏幕外 /
+# 别的按钮，导致「没能打开亲卫部队面板」，补兵整段失效 —— 现补竖屏分支。
+QINWEI_LABEL_BOX = config._p((1000, 170, 1600, 360), (560, 620, 900, 1400))
+QINWEI_ENTRY = config._p((1298, 290), (700, 1010))
+# OCR 找不到「亲卫营」标签时的兜底点（按顺序轮换，避免永远盲点同一个错位置）
+QINWEI_ENTRY_CANDIDATES = config._p(
+    ((1298, 290), (1300, 272)),
+    ((700, 1010), (760, 980), (700, 900)))
 
 # 亲卫部队面板：标题「亲卫部队」+ 左侧页签
-PANEL_TITLE_BOX = (120, 5, 620, 70)
-TAB_BOX = (20, 120, 210, 700)
-QINWEI_TABS_FALLBACK = {
-    "亲卫一": (85, 190),
-    "亲卫二": (85, 280),
-    "亲卫三": (85, 355),
-}
+PANEL_TITLE_BOX = config._p((120, 5, 620, 70), (0, 0, 900, 120))
+TAB_BOX = config._p((20, 120, 210, 700), (0, 120, 250, 900))
+QINWEI_TABS_FALLBACK = config._p(
+    {"亲卫一": (85, 190), "亲卫二": (85, 280), "亲卫三": (85, 355)},
+    {"亲卫一": (80, 210), "亲卫二": (80, 300), "亲卫三": (80, 390)})
 QINWEI_TAB_NAMES = ("亲卫一", "亲卫二", "亲卫三")
 
 # 右侧「兵力 33000/33000」
-STRENGTH_BOX = (1080, 325, 1600, 400)
+STRENGTH_BOX = config._p((1080, 325, 1600, 400), (250, 240, 900, 430))
 STRENGTH_RE = re.compile(r"(\d{3,6})\s*[/／]\s*(\d{3,6})")
 
 # 页内补兵按钮（满兵时是「兵力已满」文字；不满时同一带里出现补兵/征兵）
-REPLENISH_BOXES = ((1000, 590, 1520, 720), (1000, 700, 1520, 800),
-                   (1000, 300, 1600, 470))
+REPLENISH_BOXES = config._p(
+    ((1000, 590, 1520, 720), (1000, 700, 1520, 800), (1000, 300, 1600, 470)),
+    ((200, 950, 900, 1250), (200, 1250, 900, 1450), (200, 500, 900, 1250)))
 REPLENISH_HINTS = ("补兵", "征兵")
 REPLENISH_SKIP = ("建筑内", "自动补兵", "今日已补兵", "未消耗")
 
 # 补兵后的确认弹窗
 CONFIRM_HINTS = ("确定", "确认", "立即征兵")
-CONFIRM_BOX = (400, 300, 1260, 800)
+CONFIRM_BOX = config._p((400, 300, 1260, 800), (200, 820, 700, 1100))
 
-# 亲卫部队页左上返回箭头（与全屏页统一）
-PANEL_BACK = (78, 30)
+# 亲卫部队页 / 二级页返回（竖屏：底部左「◀ 返回」，与 config.MAIL_BACK 同一处）
+PANEL_BACK = config._p((78, 30), (110, 1512))
+# 「亲卫出击」功能尚未开发：一旦误触进去，标题会带「出击」，必须立刻退回城内
+QINWEI_ATTACK_HINTS = ("出击", "亲卫出击")
 
 # 弹窗（如「部队总览」/「一字阵」）用右上角 ✕ 关闭；左上返回箭头对弹窗无效
-DIALOG_TITLE_BOX = (70, 55, 520, 132)
+# 竖屏「部队总览」实测：标题 y≈137，关闭 ✕ ≈ (688,137)
+DIALOG_TITLE_BOX = config._p((70, 55, 520, 132), (40, 100, 620, 180))
 DIALOG_HINTS = ("部队总览", "阵")
-DIALOG_CLOSE = (1500, 95)
+DIALOG_CLOSE = config._p((1500, 95), (688, 137))
 
 
 class HomeReplenish:
@@ -119,7 +127,12 @@ class HomeReplenish:
         self.nav.ensure_map()
         self.close_dialog()
         for _ in range(max(1, tries)):
-            for point in CITY_EXIT_POINTS:
+            points: list[tuple[int, int]] = []
+            found = self.nav.home_button_point("回城")
+            if found:
+                points.append(found)
+            points += [p for p in CITY_EXIT_POINTS if p not in points]
+            for point in points:
                 self.log(f"== 点击「回城」@{point}")
                 self.adb.tap(*point)
                 time.sleep(3.0)
@@ -127,7 +140,11 @@ class HomeReplenish:
                     self.log("  ✓ 已回城（城内视角）")
                     return True
             self.log("  · 回城没生效，重试")
-        return self.at_home()
+        if self.at_home():
+            return True
+        # 回城点空时经常是界面被推进了二级页：交给 MapNav 统一兜底切回城内
+        self.log("  ! 回城未生效 → 尝试从当前页面切回城内")
+        return self.nav.recover_to_city(tries=3)
 
     # -- 亲卫营 -----------------------------------------------------------
     def _find_qinwei_label(self, img):
@@ -137,18 +154,48 @@ class HomeReplenish:
                         int(QINWEI_LABEL_BOX[1] + s.cy))
         return None
 
-    def open_qinwei(self, tries: int = 2) -> bool:
-        for i in range(tries):
+    def attack_page_open(self, img=None) -> bool:
+        """是否误入「亲卫出击」页（该功能未开发，必须立刻退回城内）。"""
+        return any(h in self.nav.page_title(img) for h in QINWEI_ATTACK_HINTS)
+
+    def switch_back(self, tries: int = 3) -> bool:
+        """误触到别的页面时切回城内视角（点「返回」/BACK，遇到退出弹窗点取消）。"""
+        if self.nav.in_city_view():
+            return True
+        self.log("  ! 当前不在城内视角（疑似误触）→ 点「返回」切回")
+        return self.nav.recover_to_city(tries=tries)
+
+    def open_qinwei(self, tries: int = 3) -> bool:
+        """打开「亲卫部队」面板。
+
+        「亲卫出击」功能未开发、亲卫营入口也尚未实测定位，因此这里**只点 OCR
+        真正认出来的「亲卫营」文字**，绝不盲点猜测坐标（盲点会推进到别的页面）。
+        找不到入口就直接返回 False，由调用方跳过本节点，不影响拉线主线。
+        """
+        for _ in range(max(1, tries)):
             img = self.adb.screencap()
             if self.panel_open(img):
                 return True
-            point = self._find_qinwei_label(img) or QINWEI_ENTRY
+            if self.attack_page_open(img):
+                self.log("  ! 误入「亲卫出击」（功能未开发）→ 立刻退回城内")
+                self.nav.recover_to_city(tries=2)
+                continue
+            if not self.nav.in_city_view(img):
+                self.switch_back()
+                img = self.adb.screencap()
+                if self.panel_open(img):
+                    return True
+            point = self._find_qinwei_label(img)
+            if point is None:
+                self.log("  · 城内没找到「亲卫营」入口 → 按约定不盲点，跳过补兵")
+                return False
             self.log(f"== 点击「亲卫营」@{point}")
             self.adb.tap(*point)
             time.sleep(2.2)
         ok = self.panel_open()
         if not ok:
             self.log("  ! 没能打开「亲卫部队」面板")
+            self.switch_back()
         return ok
 
     def tabs(self, img=None) -> list[tuple[str, tuple[int, int]]]:
@@ -181,7 +228,8 @@ class HomeReplenish:
 
     def _read_panel_note(self, img=None) -> str:
         img = img or self.adb.screencap()
-        return ocrengine.ocr_text(vision.crop(img, (1000, 580, 1600, 880)), 2.0)
+        box = config._p((1000, 580, 1600, 880), (0, 520, 900, 900))
+        return ocrengine.ocr_text(vision.crop(img, box), 2.0)
 
     def find_replenish(self, img=None):
         """在亲卫部队页里找「补兵 / 征兵」按钮，返回 (点击点, 文字) 或 (None, '')。"""
@@ -224,12 +272,16 @@ class HomeReplenish:
 
     # -- 退出 -------------------------------------------------------------
     def close_panel(self, tries: int = 2) -> bool:
-        for i in range(max(1, tries)):
+        for _ in range(max(1, tries)):
             if not self.panel_open():
                 return True
             self.adb.tap(*PANEL_BACK)
             time.sleep(1.5)
-        return not self.panel_open()
+        if not self.panel_open():
+            return True
+        # 还关不掉：交给 MapNav 兜底（识别「返回」按钮 / BACK 键 / 取消退出弹窗）
+        self.log("  ! 「亲卫部队」页关不掉 → 交给 MapNav 兜底")
+        return self.nav.recover_to_city(tries=3) and not self.panel_open()
 
     # -- 主流程 -----------------------------------------------------------
     def run(self, leave: bool = True) -> dict:

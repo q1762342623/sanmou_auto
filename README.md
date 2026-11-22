@@ -43,6 +43,7 @@ skills/sanmou-email-rally/
 | 功能三：调动前兵力检查（不满点白色补兵，补后仍 <30000 跳过该队）+ 到达后按邮件 集结/攻占/行军；邮件不可执行时先找红色敌对目标，视野无红敌则用「战报」绿色坐标 → 攻城；处理「未携带满战法」确认框；打完回据点 → 回城 | ✅ 实测通过（2026-11-21 14:06，4 队出征→返回→回城） | `skills/sanmou-email-rally/SKILL.md` §4.4–4.6 | `python -m sanmou_auto.flow_mobilize`（默认含战斗） |
 | **自动拉线**：循环「邮件分析战场 → 调动据点 → 寻找敌方进攻 → 回家补兵」，统计每轮每个节点耗时；据点列表跨轮缓存（省掉每轮 ≈340s 的同盟列表扫描）；**低兵力部队进城自动征兵、征满后每轮调兵前召回主城** | ✅ 实测通过（2026-11-21，单轮 + 1 小时长跑见 [`docs/自动拉线.md`](docs/自动拉线.md)） | — | `python -m sanmou_auto.flow_loop` |
 | **战报自动收录**：进「战报→同盟→交战」→ 逐卡展开 + 滑到底（adb 触控），同时设备内 tcpdump 抓游戏流量 → pcap 解出 BLOB → 增量 HMAC 上传报表服务器 → 等 `/api/live` 可见；1600x900 横屏实测（3 页 / 6 BLOB / 34 条记录，29s 一轮） | ✅ 实测通过（2026-11-21，ingestVersion 10414） | [`skills/战报自动收录/SKILL.md`](skills/战报自动收录/SKILL.md) | `python skills/战报自动收录/scripts/round.py` |
+| **自动拉线与战报收集**：自动拉线循环 + 把战报收录插到空闲时间（等战斗结束/轮间隔/节点安全点），**距上一次提交成功 ≥10 分钟必收**（空闲点另需距上次收集结束 ≥5 分钟）；上传失败的采集进补交队列；收集前后自动回到世界地图 | ✅ 代码完成（`--report-submit-interval` 600s + `--report-interval` 300s；`pendingUploads` 自动补交） | — | `python -m sanmou_auto.flow_line_report` |
 
 ### 环境依赖
 
@@ -71,6 +72,12 @@ python -m sanmou_auto.flow_mobilize --dry-run          # 只到点选最近可�
 python -m sanmou_auto.flow_loop                        # 自动拉线：连跑 1 小时并统计每轮节点耗时
 python -m sanmou_auto.flow_loop --minutes 10           # 跑 10 分钟
 python -m sanmou_auto.flow_loop --max-rounds 1         # 只跑一轮（冒烟）
+
+python -m sanmou_auto.flow_line_report                 # 自动拉线 + 战报收集（空闲点 5 分钟一收；距上次提交 10 分钟必收）
+python -m sanmou_auto.flow_line_report --minutes 10    # 跑 10 分钟
+python -m sanmou_auto.flow_line_report --report-interval 240   # 收紧收集间隔
+python -m sanmou_auto.flow_line_report --report-skip-upload    # 只抓不上传
+python -m sanmou_auto.flow_line_report --no-report             # 等同自动拉线
 python -m sanmou_auto.home                              # 只跑「回家补兵」节点（回城→亲卫营→检查/补兵→出城）
 ```
 
@@ -92,9 +99,11 @@ sanmou_auto/
   battle.py       正面战斗：邮件按钮（集结/攻占/行军）、红色敌对目标检测、等待结束、回城
   home.py         回家补兵：回城 → 亲卫营 → 三队兵力检查/补兵 → 出城回地图
   timing.py       步骤计时器：kind（分析/执行/等待）+ stage（四个节点）+ 汇总
+  report_collector.py **战报收集调度器**：等待分片、节点安全点、距上次提交≥10分钟必收、失败补交队列、状态持久化
   flow_mail.py    功能一完整流程 + CLI
   flow_mobilize.py 功能二+三完整流程 + CLI（战场 -> 大营 -> 调动 -> 战斗 -> 回城 -> 记录）
   flow_loop.py    **自动拉线**循环：复用 flow_mobilize，逐轮统计节点耗时，写 json/jsonl
+  flow_line_report.py **自动拉线与战报收集**：自动拉线 + 在等待时间穿插战报收录
 ```
 
 ### 调试工具

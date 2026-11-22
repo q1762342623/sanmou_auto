@@ -170,9 +170,26 @@ def _pool_stages(rounds: list[dict]) -> dict[str, dict]:
     return agg
 
 
+def _report_events_line(events: list[dict]) -> str:
+    """把本轮新增的战报收集事件压成一行。"""
+    if not events:
+        return ""
+    ok = sum(1 for e in events if e.get("ok"))
+    last = events[-1]
+    parts = [f"收集 {len(events)} 次（成功 {ok}）"]
+    if last.get("captureId"):
+        parts.append(f"最近 {last.get('captureId')}")
+    if last.get("pages") is not None:
+        parts.append(f"页 {last.get('pages')} / BLOB {last.get('uniqueBlobs')} "
+                     f"/ 记录 {last.get('completeRecords')}")
+    if last.get("error") or last.get("reason"):
+        parts.append(f"最近失败 {last.get('error') or last.get('reason')}")
+    return " | ".join(parts)
+
+
 def _print_round(i: int, started: str, wall: float,
                  by_kind: dict[str, float], by_stage: dict[str, float],
-                 res: dict) -> None:
+                 res: dict, report_events: list[dict] | None = None) -> None:
     kinds = " / ".join(
         f"{k} {fmt_seconds(by_kind[k])}"
         for k in KIND_ORDER if k in by_kind)
@@ -206,9 +223,13 @@ def _print_round(i: int, started: str, wall: float,
         elif cs.get("reason"):
             parts.append(f"进城未执行({cs.get('reason')})")
         print("    歇兵: " + " | ".join(parts))
+    report_line = _report_events_line(report_events or [])
+    if report_line:
+        print("    战报: " + report_line)
 
 
-def _print_summary(rounds: list[dict], wall_total: float, out_path: str) -> None:
+def _print_summary(rounds: list[dict], wall_total: float, out_path: str,
+                   collector=None) -> None:
     print("\n===== 汇总（自动拉线）=====")
     print(f"轮次 {len(rounds)}  总用时 {fmt_seconds(wall_total)}  "
           f"（平均 {fmt_seconds(wall_total / max(1, len(rounds)))}/轮）")
@@ -242,15 +263,30 @@ def _print_summary(rounds: list[dict], wall_total: float, out_path: str) -> None
             print(f"  [{s['stage']}·{s['kind']}] {s['name']}: 次数 {s['count']}  "
                   f"总 {fmt_seconds(s['total'])}  平均 {fmt_seconds(s['avg'])}  "
                   f"最短 {fmt_seconds(s['min'])}  最长 {fmt_seconds(s['max'])}")
+    if collector is not None:
+        status = collector.status()
+        if status.get("enabled"):
+            print("-- 战报收集 --")
+            print(f"  次数 {status['count']}（失败 {status['failures']}）  "
+                  f"间隔目标 {status['intervalSeconds']:.0f}s（不设上限）  "
+                  f"实际最大间隔 "
+                  f"{fmt_seconds(status['maxGapSeconds']) if status['maxGapSeconds'] is not None else '-'}")
+            if status.get("lastStartAt"):
+                print(f"  最近一次 {status['lastStartAt']}  "
+                      f"captureId={status.get('lastCaptureId') or '-'}  "
+                      f"ok={status.get('lastOk')}")
+            print(f"  状态/明细: {status['statePath']}")
+            print(f"             {status['logPath']}")
     print(f"明细: {out_path}")
 
 
 class MobilizeLoop:
-    def __init__(self, adb: Adb | None = None, log=print):
+    def __init__(self, adb: Adb | None = None, log=print, collector=None):
         self.adb = adb or Adb()
         self.log = log
         self.flow = MobilizeFlow(self.adb, log=log)
         self.rounds: list[dict] = []
+        self.collector = collector
 
     def run(self, duration: float = 3600.0,
             limit: int = 10, troops: tuple[int, ...] = (1, 2, 3, 4),
@@ -262,7 +298,9 @@ class MobilizeLoop:
             stop_on_no_strength: bool = True,
             max_fails: int = 5, home: bool = True,
             city_rest: bool = True,
-            city_rest_state: str | None = None) -> dict:
+            city_rest_state: str | None = None,
+            collector=None) -> dict:
+        collector = collector if collector is not None else self.collector
         self.adb.ensure_online()
         tag = time.strftime("%Y%m%d_%H%M%S")
         out_path = vision.shot_path(f"auto_line_{tag}.json")
@@ -276,6 +314,10 @@ class MobilizeLoop:
         self.log(f"== 自动拉线循环开始：计划 {fmt_seconds(duration)}"
                  f"（最多 {max_rounds or '不限'} 轮，间隔 {gap:.0f}s）")
         self.log("== 每轮节点：邮件分析战场 → 调动据点 → 寻找敌方进攻 → 回家补兵")
+        if collector is not None:
+            self.log(f"== 战报收集：{collector.summary_line()}"
+                     f"（距上次提交 ≥{collector.submit_interval:.0f}s 必收；"
+                     f"空闲点最小间隔 {collector.interval:.0f}s）")
         self.log(f"== 明细将写入 {jsonl_path}")
 
         try:
@@ -291,6 +333,7 @@ class MobilizeLoop:
                 round_started = _now()
                 t0 = time.monotonic()
                 tm = StepTimer()
+                report_before = collector.count if collector is not None else 0
                 try:
                     res = self.flow.run(
                         limit=limit, troops=troops, dry_run=dry_run,
@@ -298,7 +341,10 @@ class MobilizeLoop:
                         battle_timeout=battle_timeout,
                         min_strength=min_strength, replenish=replenish,
                         enemy_fallback=enemy_fallback, timer=tm, home=home,
-                        city_rest=city_rest, city_rest_state=city_rest_state)
+                        city_rest=city_rest, city_rest_state=city_rest_state,
+                        wait_hook=collector.wait if collector is not None else None,
+                        safe_point=(collector.safe_point
+                                    if collector is not None else None))
                     error = ""
                     fails = 0
                 except Exception as e:                  # 单轮异常不终止长跑
@@ -333,9 +379,12 @@ class MobilizeLoop:
                     "by_stage": by_stage,
                     "steps": res.get("timing") or tm.as_list(),
                     "record": res.get("record"),
+                    "report_collect": (collector.events[report_before:]
+                                       if collector is not None else []),
                 }
                 self.rounds.append(record)
-                _print_round(i, round_started, wall, by_kind, by_stage, res)
+                _print_round(i, round_started, wall, by_kind, by_stage, res,
+                             record.get("report_collect"))
                 with open(jsonl_path, "a", encoding="utf-8") as f:
                     f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
@@ -352,10 +401,18 @@ class MobilizeLoop:
                 if rest <= 0:
                     stop_reason = "duration"
                     break
-                time.sleep(min(max(0.0, gap), rest))
+                if collector is not None:
+                    collector.wait(min(max(0.0, gap), rest))
+                else:
+                    time.sleep(min(max(0.0, gap), rest))
         except KeyboardInterrupt:
             stop_reason = "interrupted"
             self.log("== 收到 Ctrl+C，写出已完成轮次")
+
+        # 正常收尾时补最后一次战报（超时未收集才真正执行）
+        if collector is not None and stop_reason in ("duration", "max-rounds",
+                                                     "no-strength"):
+            collector.safe_point("循环结束")
 
         wall_total = round(time.monotonic() - started_all, 3)
         summary = {
@@ -369,11 +426,13 @@ class MobilizeLoop:
             "by_stage": _pool_stages(self.rounds),
             "by_kind": _pool_kinds(self.rounds),
             "steps": _pool_steps(self.rounds),
+            "report_collect": (collector.status()
+                               if collector is not None else None),
             "detail": self.rounds,
         }
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(summary, f, ensure_ascii=False, indent=2)
-        _print_summary(self.rounds, wall_total, out_path)
+        _print_summary(self.rounds, wall_total, out_path, collector)
         self.log(f"== 停止原因: {stop_reason}")
         return {"stop_reason": stop_reason, "rounds": len(self.rounds),
                 "wall_total": wall_total, "path": out_path,

@@ -25,8 +25,29 @@ from pathlib import Path
 import common
 
 
+def incomplete_captures(capture_ids: list[str]) -> list[str]:
+    """找出没有翻到列表底部的 capture（采集目录里有 incomplete.json）。
+
+    一轮采集必须滑到列表真正到底才算完成；半轮数据上传会让报表缺战报，
+    因此这里在进入上传器之前直接拒绝。
+    """
+    root = common.CAPTURE_ROOT
+    if capture_ids:
+        candidates = [root / capture_id for capture_id in capture_ids]
+    elif root.is_dir():
+        candidates = [path for path in root.iterdir() if path.is_dir()]
+    else:
+        candidates = []
+    return [path.name for path in candidates if (path / "incomplete.json").is_file()]
+
+
 def upload_captures(config: dict, capture_ids: list[str],
                     config_path: str | Path | None = None) -> dict:
+    incomplete = incomplete_captures(capture_ids)
+    if incomplete:
+        return {"ok": False, "reason": "incomplete-capture",
+                "error": "未翻到底的采集不能上传：" + ", ".join(incomplete),
+                "captures": []}
     uploader = common.load_engine("upload_capture_batches")
     path = common.resolve_path(config_path or config["server"]["configPath"])
     state_path = common.WORK_DIR / "server_upload_state.json"
@@ -37,7 +58,10 @@ def upload_captures(config: dict, capture_ids: list[str],
         state_path=state_path,
         capture_ids=capture_ids or None,
     )
-    result["ok"] = bool(result.get("captures")) or not capture_ids
+    uploaded = bool(result.get("captures"))
+    # 列表没有新战报时 capture 里没有任何新增 BLOB：这不是上传失败，而是“无新增”。
+    result["nothingNew"] = bool(capture_ids) and not uploaded and not result.get("skippedCaptures")
+    result["ok"] = uploaded or not capture_ids or result["nothingNew"]
     return result
 
 

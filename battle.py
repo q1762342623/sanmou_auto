@@ -70,30 +70,47 @@ RED_MIN_DENSITY = 0.045
 RED_CENTER_SKIP = 80
 # 只扫地图中央区域：排除左侧功能图标列、底部「回城/邮件」栏、右侧部队队列，
 # 以及右下角展开菜单（结义/城务/编队/背包…）上的红色通知角标
-RED_BOX = (250, 140, 1400, 560)
+RED_BOX = config._p((250, 140, 1400, 560), (0, 300, 890, 1290))
 # 圆形红色通知角标只有 ~10x12，不是可打的敌对目标
 RED_MIN_BADGE = 14
 
-# 左下「回城」按钮（实测：图标中心 ≈ (60,772)，D6 bbox = 22,712–176,884）
-# 注意：(99,798) 已经在图标右侧的空白处点不动，故把 (60,772) 放第一位
-RETURN_HOME_POINTS = ((60, 772), (70, 790), (50, 752))
+# 左下「回城」按钮（横屏实测图标中心 ≈ (60,772)；竖屏实测 ≈ (62,1355)）
+RETURN_HOME_POINTS = config._p(
+    ((60, 772), (70, 790), (50, 752)),
+    ((62, 1355), (75, 1440), (90, 1400)))
 # 城内视角特征（回城后应出现）
-CITY_VIEW_BOX = (0, 55, 900, 420)
+CITY_VIEW_BOX = config._p((0, 55, 900, 420), (0, 260, 900, 1000))
 CITY_VIEW_HINTS = ("君王殿", "研究所", "亲卫营", "出城", "城内", "城墙", "民居")
 
 BATTLE_EXTRA_SECONDS = 60       # 到达战场后再留 60s 给战斗/返回
 POLL_SECONDS = 20.0
 
+
+def _pause(seconds: float, hook=None) -> None:
+    """等待 `seconds` 秒；有 hook 时交给它（可在等待里插入战报收集）。"""
+    seconds = float(seconds)
+    if seconds <= 0:
+        return
+    if hook is not None:
+        hook(seconds)
+    else:
+        time.sleep(seconds)
+
 # ---------------------------------------------------------------------------
-# 战报兜底（实测：左下 D5 = 战报；「防守」记录头部有绿色可点坐标，如 7级木材(709,767)）
+# 战报兜底（横屏：左下 D5 = 战报；竖屏：主界面左下交叉剑图标 ≈ (378,1317)）
 # ---------------------------------------------------------------------------
-BATTLE_REPORT_ENTRY = (363, 743)
-REPORT_TITLE_BOX = (0, 20, 460, 90)
-REPORT_TAB_BOX = (0, 95, 900, 140)
-# 每屏 3 条战报，头部行是全分辨率 y≈140 / 412 / 684
-REPORT_HEADER_BANDS = ((120, 130, 1500, 205),
-                       (392, 402, 1500, 477),
-                       (664, 674, 1500, 749))
+BATTLE_REPORT_ENTRY = config._p((363, 743), (378, 1317))
+REPORT_TITLE_BOX = config._p((0, 20, 460, 90), (0, 0, 300, 60))
+REPORT_TAB_BOX = config._p((0, 95, 900, 140), (0, 1415, 900, 1485))
+# 横屏每屏 3 条（头部 y≈140/412/684）；竖屏每屏 4 条（头部 y≈101/477/852/1227）
+REPORT_HEADER_BANDS = config._p(
+    ((120, 130, 1500, 205),
+     (392, 402, 1500, 477),
+     (664, 674, 1500, 749)),
+    ((60, 96, 890, 160),
+     (436, 472, 890, 536),
+     (811, 847, 890, 911),
+     (1186, 1222, 890, 1286)))
 REPORT_COORD_RE = re.compile(r"(\d{2,4})\s*[,，.、]\s*(\d{2,4})")
 # 战报头部里的坐标文字是绿色（实测文字像素 rgb≈(80,140,110)）
 GREEN_G = 118
@@ -580,8 +597,12 @@ class BattleFlow:
 
     # -- 等待/收尾 --------------------------------------------------------
     def _wait_battle_return(self, camp, fac, indexes: tuple[int, ...],
-                            mr, timeout: float) -> bool:
-        """等部队打完并回到据点（面板里不再有「行军/出征 mm:ss」）。"""
+                            mr, timeout: float, wait_hook=None) -> bool:
+        """等部队打完并回到据点（面板里不再有「行军/出征 mm:ss」）。
+
+        `wait_hook(seconds)` 用来分片等待：自动拉线会在这里插入战报收集，
+        战报收集结束后仍继续等满剩余时间。
+        """
         mob = self.mob
         assert mob is not None
         deadline = time.monotonic() + max(30.0, timeout)
@@ -594,7 +615,7 @@ class BattleFlow:
                 wait = min(wait, max(30.0, timeout))
                 self.log(f"  预计 {wait:.0f}s 后战斗结束"
                          f"（到达 {mr.last_arrival} + {BATTLE_EXTRA_SECONDS}s）")
-                time.sleep(max(0.0, wait))
+                _pause(max(0.0, wait), wait_hook)
         if fac is None or camp is None:
             # 没有据点上下文时无法重选据点轮询，按预估时间视为已结束
             self.log("  · 缺少据点上下文，按等待时间视为战斗结束")
@@ -622,7 +643,7 @@ class BattleFlow:
                 if fails >= 3:
                     break
             rest = deadline - time.monotonic()
-            time.sleep(max(1.0, min(POLL_SECONDS, rest)))
+            _pause(max(1.0, min(POLL_SECONDS, rest)), wait_hook)
         self.log("  ! 等待战斗结束超时（按已出征处理）")
         mob.close()
         return False
@@ -632,7 +653,7 @@ class BattleFlow:
             indexes: tuple[int, ...] = (1, 2, 3, 4),
             min_strength: int = 30000, replenish: bool = True,
             wait_return: bool = True, timeout: float = 900.0,
-            enemy_fallback: bool = True) -> dict:
+            enemy_fallback: bool = True, wait_hook=None) -> dict:
         """执行一次正面战斗。camp/fac 用来打完后回据点与回城。"""
         result: dict = {
             "ok": False, "mode": "battle", "shots": [],
@@ -700,7 +721,7 @@ class BattleFlow:
         # 4) 等战斗结束
         if wait_return:
             result["returned"] = self._wait_battle_return(
-                camp, fac, indexes, mr, timeout)
+                camp, fac, indexes, mr, timeout, wait_hook=wait_hook)
             self._mark("等待战斗结束", "等待",
                        note=f"最后到达 {mr.last_arrival or '-'}")
 

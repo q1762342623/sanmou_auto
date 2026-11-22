@@ -6,7 +6,7 @@ requires:
   device: MuMu 模拟器 127.0.0.1:16416（1600x900 横屏）+ 游戏已登录并停在世界地图
   adb: C:\Program Files\Netease\MuMu\nx_main\adb.exe（需要 `adb root` 起 tcpdump）
   python: 3.10+；依赖 cv2 / numpy / Pillow / dpkt
-  server: ListCardTeamStats 报表服务器（默认 http://127.0.0.1:8080）+ 与服务器一致的 ≥32 字符上传密钥
+  server: ListCardTeamStats 报表服务器（远端地址写在 `control/server_upload.json`，不入库）+ 与服务器一致的 ≥32 字符上传密钥
 ---
 
 # 三谋 · 战报自动收录（一轮采集 → 上报）
@@ -56,9 +56,22 @@ python scripts/doctor.py
 - `server-upload-config:false` → 按 §1.1 配置
 - `server-live:false` → 服务器没起或地址不对；本轮只能抓到本地（`--skip-upload`）
 
-### 1.1 服务器与密钥（只做一次）
+### 1.1 服务器与密钥
 
-```bash
+本机已预置远端配置（从本地端工程 `list_card_team_stats-main` 同步）：
+
+- `control/server_upload.json`：`baseUrl=http://<报表服务器>:8080`（本机配置，勿提交）
+- `control/server_upload_secret.txt`：与远端服务器一致的上传密钥
+- `config.json`：`adbPath` / `serial=127.0.0.1:16416`，`server.baseUrl` 留空以读取上面的上传配置
+
+报表入口：`http://<报表服务器>:8080/`；`python scripts/doctor.py` 的
+`server-upload-config` 与 `server-live` 必须为 `true`。
+
+换服务器或密钥时重新生成这两个运行文件（二者均被 `.gitignore` 忽略，不要提交）：
+
+```powershell
+.\scripts\configure_server_upload.ps1 -BaseUrl "http://<报表服务器>:8080" -Secret "至少32字符的随机密钥"
+# 或手工：
 copy control\server_upload.example.json control\server_upload.json
 # 编辑 baseUrl；把与服务器一致的密钥写进 control\server_upload_secret.txt（≥32 字符，不要提交）
 copy config.example.json config.json
@@ -97,37 +110,43 @@ python scripts/round.py
 
 1. **采集** `capture.py`：确认设备/root → 已在战报页则先返回（`forceReload`，否则列表不重新请求）→
    发现游戏 TCP 端口 → 起 tcpdump → 进「战报 → 同盟 → 交战」并用 OCR + 金色边框校验页签 →
-   每屏自下而上点开折叠卡 → 滑动 → 连续两页画面无变化即到底（或 `--max-pages` / `--max-seconds`）
-   → 停 tcpdump、拉 pcap。
-2. **提取** `extract.py`：解 BLOB、去重、算 `uniqueBlobs/rawRecords/completeRecords`。
+   **每屏自下而上点开折叠卡 → 上滑 → 重复，直到列表真正到底**（连续两屏滑不动，且每屏
+   滑后都会再等一次排除“正在请求下一批”）。`maxPages=0` 默认不设页数上限，只有
+   `stopReason:"list_end"` 才是完整一轮；`--max-seconds`/`hardMaxPages` 只是防止死循环的
+   安全阈值，触发时本轮标记为不完整。
+2. **完整性门槛**：production 采集若 `complete:false`（`page_limit` / `max_runtime` /
+   `hard_page_cap` / 弹窗 / 页签丢失），会在 capture 目录写 `incomplete.json` 并直接判失败，
+   **保留 pcap 与截图但拒绝提取上传**；`upload.py` 也会拒绝带 `incomplete.json` 的 capture。
+3. **提取** `extract.py`：解 BLOB、去重、算 `uniqueBlobs/rawRecords/completeRecords`。
    `uniqueBlobs=0` 或 `completeRecords=0` 直接判失败（这轮没有可统计战报）。
-3. **上传** `upload.py`：只发本次 capture 新增 BLOB；服务器逐文件校验 size+sha256，批次幂等。
-4. **等可见**：轮询 `/api/live`，直到 `visibleIngestVersion ≥` 本次回执 `ingestVersion`
-   （默认最多 180s，`--no-wait` 可跳过）。
+4. **上传** `upload.py`：只发本次 capture 新增 BLOB；服务器逐文件校验 size+sha256，批次幂等。
+5. **等可见**：轮询 `/api/live`，直到 `visibleIngestVersion ≥` 本次回执 `ingestVersion`
+   （默认最多 900s：服务器 180s 发布静默窗口 + 约 120s 构建，180s 必然超时；`--no-wait` 可跳过）。
+   超时只代表“还没发布完”，数据已入库，不要重传。
 
-期望输出（节选，2026-11-21 17:50 实测）：
+期望输出（节选，2026-11-21 18:32 诊断实测：一直滑到列表底部才结束）：
 
 ```json
-{"ok":true,"captureId":"mumu_adb_production_20261121_175045_386",
- "capture":{"pages":3,"expandedCards":3,"expandFailures":1,"navigationsRecovered":0,
-            "stopReason":"page_limit","pcapBytes":152605,"gamePorts":[20090],
-            "screen":{"width":1600,"height":900}},
- "extract":{"uniqueBlobs":6,"rawRecords":34,"completeRecords":34,"xorKeySource":"auto"},
- "upload":{"uploadedBatches":1,"uploadedFiles":6,"uploadedBytes":24324,
-           "captures":[{"ingestVersion":10414}]}}
+{"ok":true,"captureId":"mumu_adb_diagnostic_20261121_183234_154",
+ "capture":{"pages":5,"screens":9,"complete":true,"expandedCards":3,"expandFailures":1,
+            "navigationsRecovered":3,"stopReason":"list_end","pcapBytes":323106,
+            "gamePorts":[20090],"screen":{"width":1600,"height":900}},
+ "extract":{"uniqueBlobs":9,"rawRecords":48,"completeRecords":48,"xorKeySource":"auto"}}
 ```
 
-`--max-pages` 只是冒烟/限流用；不带它时一轮会一直滑到列表底部（`stopReason:"list_end"`）。
+`pages` 是真正滑动的次数，`screens` 是处理过的屏数（含最后两屏“滑不动”的确认）。
+`--max-pages` 只用于冒烟/校准，任何 >0 的值都会让本轮 `complete:false`、无法上传。
 上传成功后回执里 `ingestVersion` 必须为正；等可见时再比对 `/api/live.visibleIngestVersion`。
 
 ### 3.1 只抓不传（诊断）
 
 ```bash
-python scripts/capture.py --kind diagnostic --max-pages 2 --max-seconds 240
+python scripts/capture.py --kind diagnostic --max-seconds 240   # 同样翻到列表底
 python scripts/extract.py --capture-dir captures/<captureId>
 ```
 
 diagnostic 的 capture **不能上传**（服务器会拒绝），只用于验证导航/端口/解码。
+需要快速看某一屏时才用 `--max-pages N`；这种采集会标记 `complete:false`。
 
 ### 3.2 断点补传
 
@@ -142,11 +161,13 @@ python scripts/upload.py --capture-id <captureId>
 | 现象 | 判定 | 处理 |
 | --- | --- | --- |
 | `combatTabSelected:false` 连续 3 次 | 页签没点中/被活动弹窗挡住 | `screen.py state` 看 `blockingOverlay`；`screen.py back-to-map` 后重试；必要时调 `targets` |
-| `expandFailures` 偏高、`expandedCards` 少 | 展开条模板尺度不匹配 | 调 `expand.templateScale`（0.8~1.1）、`threshold`、`minFrameRows`；`detect_arrows` 的 rejected 里有原因 |
+| `expandFailures` 偏高、`expandedCards` 少 | 展开条没点中：多为「列表还没停稳就取坐标」 | 确认 `capture.stableTimeoutMs≥2000` 生效（`capture.py` 的 `wait_still`）；再调 `expand.templateScale`（0.8~1.1）与 `maxWidth/maxHeight` |
 | `stopReason:"blocking_overlay"` | 中途弹窗/公告 | 留证截图在 captureDir，人工清一次再重跑 |
-| `stopReason:"list_end"` 但 `pages` 很小 | 列表本来就是旧内容（没新战报） | 正常；本轮 `uniqueBlobs` 可能为 0，属“无新增”，不是故障 |
+| `stopReason:"list_end"` 但 `pages` 很小 | 列表本来就是旧内容（没新战报），或滑动被游戏吞掉 | 先看 `capture_result.json → pageLog`：`shiftPx` 应稳定在 -300~-430，若多次出现 0/正值说明手势被吞/列表刷新；`leftoverDowns` 不为 0 说明本屏还有折叠卡没展开 |
+| `complete:false`（`page_limit`/`max_runtime`/`hard_page_cap`） | 没翻到底，本轮不完整 | 增加 `--max-seconds` 后重跑；不要手工上传该 capture（`incomplete.json` 已被 upload 拒绝） |
+| 滑到底后仍缺最后一张折叠卡 | 末尾卡高度不足 `expand.minHeight`，未被点击 | 先看 `screen_page_*_after_swipe.png`；必要时调小 `expand.minHeight` 或人工补收 |
 | `stopReason:"combat_tab_lost"` | 误进了「战果」详情页且返回失败 | 看 `screen_page_*_after_swipe.png`；脚本已自动返回一次，连续失败再人工清页面 |
-| `navigationsRecovered > 0` | 展开时点到卡片本体、进了详情页 | 已自动返回，不影响本轮；若频繁出现调 `expand.minHeight`/`downThreshold` |
+| `navigationsRecovered > 0` | 展开时点到卡片本体、进了详情页（坐标已过期：滑动后列表仍在动） | 已自动返回；正常应为 0。若频繁出现，检查 `capture.stable*` 与 `expand.clickBottomInset`，并确认点击点没离开金色竖条 |
 | `no-blobs` | 端口错/没进列表/抓包太短/列表未重新请求 | 先确认 `capture.forceReload=true`；再看 `tcpdump.log` 与 `gamePorts`，必要时延长 `--max-seconds` |
 | `visible-wait-timeout` | 服务器还没发布完 | 数据已入库，稍后 `/api/live` 会追上；不要重传 |
 | pcap ≤24 字节 | 抓包进程没起来 | 确认 `adb root`、设备内有 tcpdump、端口发现结果非空 |
@@ -169,6 +190,9 @@ python scripts/upload.py --capture-id <captureId>
 
 1. **同一台模拟器同一时间只能跑一个自动化**：与「自动拉线」(`flow_loop`) 互斥，
    否则触控会互相打断；先停一边。
+   已提供串行整合版 `python -m sanmou_auto.flow_line_report`
+   （自动拉线 + 在等待/节点安全点插入本技能，距上次提交 ≥10 分钟必收，
+   收集前后自动回世界地图）；该模式运行期间不要再手动并发跑 `round.py`。
 2. 只做外部截图 + `input tap/swipe`，不注入、不 hook、不改包。
 3. 不按 Android BACK 关面板（会弹「确认退出」），一律点页面自带返回箭头。
 4. pcap、截图、tcpdump.log **只留在本地**，上传的只有 `blobs/` + 元数据。

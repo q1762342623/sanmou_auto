@@ -40,67 +40,89 @@ from .timing import STAGE_MOBILIZE
 _STATUS_RE = re.compile(r"(空闲|停留|行军|调动|驻守|出征)(?:\D{0,2}(\d{1,2}:\d{2}:\d{2}))?")
 
 # 卡片中心（全分辨率）
-CARD_X = {1: 115, 2: 323, 3: 539, 4: 760, 5: 960}
-CARD_Y = 700
+# 竖屏实测（2026-11-22，900x1600）：5 张卡中心 x=105/277/449/620/792，
+# 名字行 y≈1299、兵力行 y≈1331；旧值全是横屏坐标，竖屏会点到地图上。
+CARD_X = config._p({1: 115, 2: 323, 3: 539, 4: 760, 5: 960},
+                   {1: 105, 2: 277, 3: 449, 4: 620, 5: 792})
+CARD_Y = config._p(700, 1320)
 # 卡片状态文字条带（避开上方「请选择出征部队」提示行 y≈592）
-STATUS_BAND = (0, 612, 1090, 678)
+# 竖屏状态小字在卡顶 y≈1255–1292（OCR 常读不出，读不到按「未知」处理）
+STATUS_BAND = config._p((0, 612, 1090, 678), (0, 1255, 900, 1292))
 # 单卡状态条：整条带切块 OCR 一次要 10s+，按卡裁窄条只要 0.3s（实测）
-STATUS_CARD_WIDE = 130          # 首选：cx±130（能同时读到「行军 + 倒计时」）
-STATUS_CARD_NARROW = 95         # 兜底：cx±95（个别卡窄条才读得出）
+STATUS_CARD_WIDE = config._p(130, 80)     # 首选：cx±130（能同时读到「行军 + 倒计时」）
+STATUS_CARD_NARROW = config._p(95, 62)    # 兜底：cx±95（个别卡窄条才读得出）
 # 选中卡上边框是亮金色（实测在 y≈629，宽约 210 像素，单行金色像素 ≈124；
 # 未选中的卡这一行几乎为 0），用它判断「到底选中了哪支部队」
-CARD_SELECT_BAND = (620, 646)
-CARD_HALF_W = 105
-CARD_SELECT_MIN = 100      # 选中卡 ≈116~124，非选中卡 ≤10（避免误判）
-# 右侧「耗时」值
-COST_BOX = (1455, 698, 1600, 742)
+CARD_SELECT_BAND = config._p((620, 646), (1228, 1262))
+CARD_HALF_W = config._p(105, 80)
+CARD_SELECT_MIN = config._p(100, 30)   # 选中卡 ≈116~124，非选中卡 ≤10（避免误判）
+# 竖屏金框像素区分度差（实测最亮行只有 21~46），无法可靠判定，选中校验直接放宽
+CARD_SELECT_RELIABLE = not config.PORTRAIT
+# 右侧「耗时」值（竖屏「耗时 00:10:25」实测 @(458,1529)）
+COST_BOX = config._p((1455, 698, 1600, 742), (390, 1505, 570, 1550))
 # 金色「出征」按钮的搜索区域：只框按钮所在的下半块
 # 实测按钮本体 bbox = 1283,779–1576,861；上方 y≈680–760 的金色「体力 / 耗时」
 # 图标与文字必须排除，否则算出来的点击点会落在按钮上方的说明行（点不出征的主因）
-EXIT_REGION = (1200, 745, 1600, 890)
+# 竖屏实测按钮金色行 y=1464..1546，「出征」文字 @(730,1505)
+EXIT_REGION = config._p((1200, 745, 1600, 890), (540, 1430, 900, 1580))
 # 按钮本体最小尺寸与金色像素总量下限
-EXIT_MIN_W, EXIT_MIN_H = 160, 44
-EXIT_MIN_AREA = 4000        # 能定位到按钮的最低金色像素总量（禁用态也高于它）
-EXIT_DIM_PIXELS = 14000     # 正常态约 1.7 万，低于此值说明按钮被压暗（该部队被限制）
+EXIT_MIN_W, EXIT_MIN_H = config._p((160, 44), (150, 60))
+EXIT_MIN_AREA = config._p(4000, 8000)   # 能定位到按钮的最低金色像素总量（禁用态也高于它）
+EXIT_DIM_PIXELS = config._p(14000, 12000)  # 正常态约 1.7 万，低于此值说明按钮被压暗
 # 按钮宽高比（293x82 ≈ 3.6），用来排除地图上的其它金色块
 EXIT_RATIO = (2.0, 5.0)
 # 金色判定：先严格，找不到再放宽（按钮禁用态会暗一些）
 GOLD_STRICT = (205, 175, 120, 205)      # r>205 g>175 120<b<205
 GOLD_LOOSE = (180, 150, 100, 215)
-# 兜底点：实测按钮中心 (1430,820)，全部落在按钮内部
-EXIT_FALLBACKS = ((1430, 820), (1430, 806), (1430, 834), (1400, 820))
+# 兜底点：实测按钮中心 (1430,820)，全部落在按钮内部；竖屏按钮中心 (730,1505)
+EXIT_FALLBACKS = config._p(
+    ((1430, 820), (1430, 806), (1430, 834), (1400, 820)),
+    ((730, 1505), (730, 1483), (730, 1527), (650, 1505)))
 # ---------------------------------------------------------------------------
 # 兵力 / 补兵（实测截图 n2_调动_094349.jpg，1600x900）
 # 卡片底部一行「兵力 30000」；其中「兵力」在卡左半、数字在卡右半（y≈800–865），
 # 单卡按 cx-125..cx+115 裁条 OCR 可稳定读到（整条带一次 OCR 会把 5 张卡粘成一行）
 # ---------------------------------------------------------------------------
-STRENGTH_BAND = (800, 868)
-STRENGTH_BOX_DX = (-125, 115)       # 相对卡片中心 x 的左右偏移
-STRENGTH_NUMBER_DX = 70             # 数字片段大致中心（相对卡片中心 x）
-STRENGTH_FULL = 30000               # 单队满编兵力（低于它视为不满，需要补兵）
-STRENGTH_OCR_SCALES = (3.5, 4.0, 3.0)
+# 竖屏实测：兵力行「兵力 33000」y≈1331（卡片中心 105 时「兵力」在 x≈56、数字 x≈145）
+STRENGTH_BAND = config._p((800, 868), (1315, 1352))
+# 竖屏卡片中心 105 时，「兵力」x≈56、数字「33000」中心 x≈145（右边界≈180）。
+# 左侧 -62、右侧 +95 才能把 5 位数字完整框住（原 +60 裁掉了末位 → 33000 读成 3300）。
+STRENGTH_BOX_DX = config._p((-125, 115), (-62, 95))   # 相对卡片中心 x 的左右偏移
+STRENGTH_NUMBER_DX = config._p(70, 40)  # 数字片段大致中心（相对卡片中心 x）
+# 单队满编兵力。2026-11-22 按实测校准：满编是 **33000**。
+# 低于它一律视为「不满」——不满的部队不再出征，而是调动到附近己方城池歇兵征兵，
+# 直到征满 33000 才召回主城（见 sanmou_auto/city_rest.py）。
+STRENGTH_FULL = 33000
+STRENGTH_OCR_SCALES = config._p((3.5, 4.0, 3.0), (4.0, 4.5, 3.5))
 # 「补兵」按钮：出征按钮附近（不同据点面板位置会变，实测有「一键补兵」贴出征上方，
 # 也有白色小方块贴在出征左侧）。注意卡片行里的红色「征兵 03:18:30」是自动征兵的
 # 倒计时徽标，不是按钮；右下角「消耗辎重」开关也不要碰。
-REPLENISH_REGION = (1000, 620, 1600, 880)
-REPLENISH_REGIONS = ((1000, 620, 1600, 880), (1000, 300, 1600, 470))
+REPLENISH_REGION = config._p((1000, 620, 1600, 880), (300, 1360, 900, 1460))
+REPLENISH_REGIONS = config._p(
+    ((1000, 620, 1600, 880), (1000, 300, 1600, 470)),
+    ((300, 1360, 900, 1460), (0, 1150, 900, 1270)))
 REPLENISH_HINTS = ("补兵", "一键补兵")
 REPLENISH_SKIP_HINTS = ("消耗辎重", "征兵 ", "自动", "今日已补兵")
 # 补兵后可能的确认弹窗（只认「确定/确认/立即征兵」，避免把「自动征兵」文字再点一次）
-REPLENISH_DIALOG_BOX = (400, 300, 1260, 800)
+REPLENISH_DIALOG_BOX = config._p((400, 300, 1260, 800), (250, 760, 660, 920))
 REPLENISH_CONFIRM_HINTS = ("确定", "确认", "立即征兵")
 # 「调动」面板的静态提示行：出征按钮不可用（灰色）时靠它判断面板仍然开着
-PANEL_HINT_BOX = (400, 575, 1150, 610)
+PANEL_HINT_BOX = config._p((400, 575, 1150, 610), (0, 1235, 900, 1300))
 PANEL_HINTS = ("请选择出征部队", "调动速度")
+# 面板底部整块（部队卡 + 体力/耗时 + 出征按钮）：按钮变灰时也必然可见，
+# 用它兜底判断「面板其实还开着」，避免误判成收起后又去重新找据点（很慢）。
+PANEL_BOTTOM_BOX = config._p((900, 600, 1600, 900), (0, 1230, 900, 1600))
+PANEL_BOTTOM_PAIR = ("不消耗", "耗时")
 # 出征确认弹窗：「部队未携带满战法，是否继续出征？」→ 点左侧「继续出征」
-# 实测（1600x900）：提示框居中，继续出征 ≈ (608,541)，前往调整 ≈ (987,541)
-DISPATCH_DIALOG_BOX = (420, 260, 1300, 800)
+# 横屏提示框居中 (608,541)；竖屏按钮行实测在 y≈845，左键 x≈366
+DISPATCH_DIALOG_BOX = config._p((420, 260, 1300, 800), (250, 760, 660, 920))
 DISPATCH_DIALOG_HINTS = ("是否继续出征", "未携带满战法", "继续出征")
-DISPATCH_CONTINUE_POINT = (608, 541)
-# 顶部服务器时间
-SERVER_TIME_BOX = (1425, 16, 1592, 64)
-# 面板左上返回
-PANEL_BACK = (100, 25)
+DISPATCH_CONTINUE_POINT = config._p((608, 541), (366, 845))
+# 顶部服务器时间（竖屏移到左上角时间行）
+SERVER_TIME_BOX = config._p((1425, 16, 1592, 64), (0, 8, 220, 46))
+# 面板关闭（横屏左上返回；竖屏实测底部左侧 3 个候选点、
+# 右下 (860,1240) 都无效，真正能收起「调动/出征」面板的是地图中央的 ✕ @(528,585)）
+PANEL_BACK = config._p((100, 25), (528, 585))
 
 RUNNING_HINTS = ("行军", "调动", "出征", "驻守")
 
@@ -275,11 +297,17 @@ class Mobilizer:
         出征按钮可用时按金色按钮判断（快）；按钮被禁用（灰）时金色块不存在，
         再 OCR 提示行兜底——否则会把「面板开着但按钮不可用」误判成面板没开，
         进而反复点「调动」把面板开关反了。
+        竖屏提示行常读不出，最后用底部「体力(不消耗) + 耗时」组合兜底。
         """
         img = img or self.adb.screencap()
         if self.find_exit_box(img) is not None:
             return True
-        return self._hint_visible(img)
+        if self._hint_visible(img):
+            return True
+        text = "".join(s.text for s in ocrengine.ocr(
+            vision.crop(img, self._scaled_box(img, PANEL_BOTTOM_BOX)), 2.0)
+        ).replace(" ", "")
+        return all(h in text for h in PANEL_BOTTOM_PAIR)
 
     def open_from_camp(self, wait: float = 1.8, tries: int = 3) -> bool:
         """点「调动」打开面板；地图上没有该按钮时用 reselect 重新选中据点。
@@ -311,10 +339,13 @@ class Mobilizer:
                 self.log(f"  · 第{i + 1}次点「调动」后面板没打开（可能点到地图标签），重试")
                 self.nav.ensure_map()
                 continue
-            if self.reselect and not reselect_used and i >= 1:
+            # 出征后面板自动收起时右侧按钮列会短暂读不到「调动」：
+            # 立刻复用已选好的据点重新打开面板（reselect 只点已知坐标，不再解析候选据点），
+            # 不要先空等 3s 重试——那样每派一队就多绕十几秒。
+            if self.reselect and not reselect_used:
                 reselect_used = True
                 self.log(f"  · 地图上没有「调动」按钮（当前: {[t for t, _ in btns]}），"
-                         "重新选中据点")
+                         "直接用已选据点重开面板")
                 if not self.reselect():
                     self.log("  × 重新选中据点失败")
                     return False
@@ -560,6 +591,11 @@ class Mobilizer:
             return st, False, False
         point = self.find_replenish_button()
         if not point:
+            # 面板可能在前一次点选/点按钮时被收起，按钮自然找不到；
+            # 重开面板再找一次，不能因为一次误触就判这队「兵力不足」。
+            if self.open_from_camp():
+                point = self.find_replenish_button()
+        if not point:
             self.log(f"  ! 部队{idx} 没找到「补兵」按钮（可能已在自动征兵），跳过")
             return st, False, False
         self.log(f"  部队{idx} 兵力 {st} < {min_strength} → 点击补兵 {point}")
@@ -723,19 +759,38 @@ class Mobilizer:
             return False
         x, y = CARD_X[idx], CARD_Y
         offsets = ((0, 0), (-12, 0), (12, 0), (0, -16), (0, 16))
-        for i in range(max(1, min(tries, len(offsets)))):
+        limit = max(1, min(tries, len(offsets)))
+        i = 0
+        reopened = False
+        while i < limit:
             dx, dy = offsets[i]
             self.adb.tap(x + dx, y + dy)
             time.sleep(wait)
             img = self.adb.screencap()
             if not self.find_exit_box(img):
-                self.log("  ! 点完卡片面板消失，停止点选")
                 self._last_img = img
+                # 竖屏点卡片容易顺带把面板收起；重开面板重试同一位置。
+                # 不能因为一次误触就把这队判死——否则少打一场，还会被算进
+                # 「残兵影响其他队」的假象里。
+                if not reopened and self.open_from_camp():
+                    reopened = True
+                    self.log(f"  · 部队{idx} 点选后「调动」面板被收起，"
+                             "已重新打开并重试")
+                    limit = min(limit + 1, len(offsets))
+                    continue
+                self.log(f"  ! 部队{idx} 点选后面板消失且重开失败，跳过该队")
                 return False
             if self.selected_card(img) == idx:
                 self._last_img = img
                 return True
+            if not CARD_SELECT_RELIABLE and self.find_exit_box(img):
+                # 竖屏选中金框区分度太低（实测最亮行仅 21~46），校验不可靠；
+                # 只要面板还在、点击落在卡片上，就按「已选中」处理，避免逐队跳过。
+                self._last_img = img
+                self.log(f"  · 部队{idx} 竖屏无法校验选中态，按已选中处理（面板仍在）")
+                return True
             self.log(f"  · 部队{idx} 第{i + 1}次点选未命中，换位置再点")
+            i += 1
         return False
 
     # -- 派兵 -------------------------------------------------------------
@@ -829,6 +884,12 @@ class Mobilizer:
                 self._mark_dispatched(troop, st, cost_sec, arrive)
                 self.log(f"  ✓ 部队{idx} 已出发（点 {point}，状态「{st}」），"
                          f"预计 {troop.arrive_at or '未知'} 到达")
+                return troop
+            if not st and config.PORTRAIT and box and count >= EXIT_DIM_PIXELS:
+                # 竖屏卡面状态小字 OCR 读不出（实测读不到「空闲/行军」），
+                # 按钮明亮且已点到本体 → 按「已提交」处理，避免重复点击把面板点乱。
+                self._mark_dispatched(troop, "已出征(竖屏状态不可读)", cost_sec, arrive)
+                self.log(f"  ✓ 部队{idx} 已点击出征（竖屏读不到卡面状态，按已提交处理，点 {point}）")
                 return troop
 
             if not st and not self.panel_open():

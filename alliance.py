@@ -29,31 +29,32 @@ from .mapnav import COORD_RE, MapNav
 # ---------------------------------------------------------------------------
 # UI 坐标（全分辨率）
 # ---------------------------------------------------------------------------
-ALLIANCE_ENTRY = (905, 840)
-FACILITY_TAB = (795, 838)
-UNION_BUILD_FILTER = (96, 536)
-FACILITY_BACK = (100, 25)
-CITY_TAB = (1523, 844)
+# 竖屏值为布局估算（页签行 y≈1455、返回在底部 115,1548），首次实测后校准
+ALLIANCE_ENTRY = config._p((905, 840), (360, 1528))
+FACILITY_TAB = config._p((795, 838), (200, 1455))
+UNION_BUILD_FILTER = config._p((96, 536), (80, 700))
+FACILITY_BACK = config._p((100, 25), (115, 1548))
+CITY_TAB = config._p((1523, 844), (560, 1455))
 
 # 同盟页底部页签行（OCR 定位「设施 / 城池」比写死 x 稳）
-TAB_ROW_BOX = (600, 750, 1600, 880)
+TAB_ROW_BOX = config._p((600, 750, 1600, 880), (0, 1400, 900, 1560))
 # 设施/城池页左栏筛选
-LEFT_PANEL_BOX = (0, 80, 380, 880)
+LEFT_PANEL_BOX = config._p((0, 80, 380, 880), (0, 60, 300, 1400))
 
 # 设施表格区域（全分辨率）
-LIST_BOX = (455, 95, 1600, 660)
+LIST_BOX = config._p((455, 95, 1600, 660), (0, 60, 900, 1300))
 # 表格 OCR 切块参数（400x220 + 110 重叠，实测坐标可整段识别）
 LIST_TILE = (400, 220)
 LIST_OVERLAP = 110
 # 设施表格内向上翻页
-LIST_SCROLL = (900, 620, 900, 220)
+LIST_SCROLL = config._p((900, 620, 900, 220), (450, 1250, 450, 800))
 
 # 城池列表：只 OCR「封邑(郡名+坐标)」和「入驻」两列，速度快一倍以上
-CITY_TEXT_BOX = (700, 130, 1430, 830)
+CITY_TEXT_BOX = config._p((700, 130, 1430, 830), (0, 100, 900, 1300))
 CITY_TILE = (620, 200)
 CITY_OVERLAP = 60
-CITY_SCROLL = (900, 720, 900, 300)      # 列表内向上翻页
-CITY_SCROLL_DOWN = (900, 300, 900, 720)  # 回顶
+CITY_SCROLL = config._p((900, 720, 900, 300), (450, 1350, 450, 800))      # 列表内向上翻页
+CITY_SCROLL_DOWN = config._p((900, 300, 900, 720), (450, 800, 450, 1350))  # 回顶
 CITY_MAX_PAGES = 14
 # 跳转后没有「调动」按钮的行（枢要之地等）
 NO_MOBILIZE_HINTS = ("无法入驻",)
@@ -345,9 +346,19 @@ class AllianceFacilities:
         return None
 
     def read_city_name(self, point: tuple[int, int]) -> str:
-        """在城池列表左侧「城池」列，按行读一下这一行的名字（列表页不在热路径上）。"""
+        """在城池列表左侧「城池」列，按行读一下这一行的名字（列表页不在热路径上）。
+
+        注意：不能把 y 上限写死成横屏的 830 —— 竖屏城池行 y≈1300+ 时
+        会算出 y1>y2，PIL 直接抛 `Coordinate 'lower' is less than 'upper'`。
+        """
         img = self.adb.screencap()
-        box = (10, max(130, point[1] - 62), 320, min(830, point[1] + 8))
+        k = img.width / float(config.SCREEN[0])
+        y1 = max(0, point[1] - 62)
+        y2 = min(img.height, point[1] + 8)
+        if y2 - y1 < 20:                 # 坐标越界时兜底成固定小条，避免反向框
+            y1 = max(0, min(img.height - 90, point[1] - 70))
+            y2 = min(img.height, y1 + 90)
+        box = (0, y1, min(img.width, int(320 * k)), y2)
         best = ""
         for s in ocrengine.ocr(vision.crop(img, box), 2.5):
             t = s.text.replace(" ", "")
@@ -364,8 +375,15 @@ class AllianceFacilities:
         return c
 
     def find_city_row(self, camp: Camp,
-                      pages: int = CITY_MAX_PAGES) -> Camp | None:
-        """用扫描时记录的屏号先滚过去，再前后几屏里找（找不到再全表扫）。"""
+                      pages: int = CITY_MAX_PAGES,
+                      full_scan: bool = False) -> Camp | None:
+        """用扫描时记录的屏号先滚过去，再前后几屏里找。
+
+        `full_scan=False`（默认）时不回顶全表重扫：屏号来自本轮/本缓存的扫描，
+        ±几屏找不到基本就是该据点已经不在了。全表重扫 14 屏（每屏列表 OCR
+        5~10s + 滑动）单次就要 2~5 分钟，实测正是「定位最近据点 378s」的主因；
+        交给上层换下一个候选只要几十秒。只有最后一个候选才传 full_scan=True。
+        """
         self.scroll_cities_to_top()
         start = max(0, camp.page - 2)
         for _ in range(start):
@@ -377,9 +395,9 @@ class AllianceFacilities:
                     return self._fill_city_name(c)
             self.adb.swipe(*CITY_SCROLL, 450)
             time.sleep(0.9)
-        if start == 0:
+        if not full_scan or start == 0:
             return None
-        # 屏号估计不准时回顶完整扫一遍（慢，但只在异常时走）
+        # 屏号估计不准时回顶完整扫一遍（慢，只在最后一个候选时走）
         self.scroll_cities_to_top()
         for _ in range(pages + 1):
             for c in self.parse_cities():
@@ -467,11 +485,16 @@ class AllianceFacilities:
             return True
         return False
 
-    def select(self, camp: Camp, confirm_wait: float = 2.2) -> bool:
-        """打开对应列表 → 找到该坐标 → 点击 → 确认跳转 → 校验右侧有「调动」。"""
+    def select(self, camp: Camp, confirm_wait: float = 2.2,
+               full_scan: bool = False) -> bool:
+        """打开对应列表 → 找到该坐标 → 点击 → 确认跳转 → 校验右侧有「调动」。
+
+        返回 True 即表示「跳转后确实看到了调动按钮」——调用方不必再校验一次
+        （`has_mobilize_button()` 是一次整屏按钮 OCR，重复调用纯属浪费）。
+        """
         if camp.source == "city":
             self.open_cities_page()
-            hit = self.find_city_row(camp)
+            hit = self.find_city_row(camp, full_scan=full_scan)
         else:
             if not self.open_union_buildings():
                 return False
@@ -495,7 +518,7 @@ class AllianceFacilities:
             self.log(f"  ! 跳转后没看到「行军/调动」按钮，重试一次（{i + 1}/2）")
             if camp.source == "city":
                 self.open_cities_page()
-                hit = self.find_city_row(camp)
+                hit = self.find_city_row(camp, full_scan=full_scan)
             else:
                 if not self.open_union_buildings():
                     return False

@@ -75,24 +75,40 @@ def cmd_preview(config: dict, args) -> dict:
 
 
 def cmd_back_to_map(config: dict, args) -> dict:
-    """点页面自带返回箭头（不按 BACK，避免「确认退出」）。"""
+    """点页面自带返回箭头回世界地图（不按 BACK，避免「确认退出游戏」）。
+
+    判据只用底栏 OCR（`common.map_visible`）：点到出现「武将/同盟/征战」为止。
+    另外每轮先检查并取消 `ExitActivity`，防止卡在「确认退出游戏」弹窗上。
+    """
     adb = common.make_adb(config)
     adb.ensure_online()
     shot = common.WORK_DIR / "back_current.png"
     width, height = adb.screenshot(shot)
     targets = common.targets_for(config, width, height)
     presses = 0
+    if common.map_visible(shot, config):
+        return {"ok": True, "presses": presses, "path": str(shot),
+                "state": _brief(common.page_state(shot, config)),
+                "via": "map"}
+
     for _ in range(args.max_presses):
-        state = common.page_state(shot, config)
-        if not state.get("reportPage") and not state.get("blockingOverlay"):
-            return {"ok": True, "presses": presses, "path": str(shot),
-                    "state": _brief(state)}
-        adb.tap(*targets["pageBack"], wait_ms=700)
+        if adb.exit_dialog_visible():
+            adb.cancel_exit_dialog()
+            adb.screenshot(shot)
+            continue
+        adb.tap(*targets["pageBack"], wait_ms=800)
         presses += 1
         adb.screenshot(shot)
+        if common.map_visible(shot, config):
+            state = common.page_state(shot, config)
+            return {"ok": True, "presses": presses, "path": str(shot),
+                    "state": _brief(state), "via": "map"}
+
     state = common.page_state(shot, config)
-    return {"ok": True, "presses": presses, "path": str(shot),
-            "state": _brief(state), "note": "达到最大返回次数，状态见 state"}
+    ok = common.map_visible(shot, config)
+    return {"ok": ok, "presses": presses, "path": str(shot),
+            "state": _brief(state),
+            "note": "达到最大返回次数，状态见 state"}
 
 
 def _brief(state: dict) -> dict:

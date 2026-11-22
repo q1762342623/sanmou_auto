@@ -42,11 +42,15 @@ class MailBody:
         return "\n".join(self.lines)
 
 
-def find_coord_span(img: Image.Image, box: tuple[int, int, int, int]):
-    """在指定区域找坐标文字片段，返回 (坐标, 屏幕点击点)。"""
-    crop = vision.crop(img, box)
+def find_coord_span(img: Image.Image, box: tuple[int, int, int, int], rows=None):
+    """在指定区域找坐标文字片段，返回 (坐标, 屏幕点击点)。
+
+    rows: 可选，复用调用方已做的 OCR 结果（坐标为相对 box），避免同一区域识别两遍。
+    """
+    if rows is None:
+        rows = ocrengine.ocr_rows(vision.crop(img, box), config.MAIL_COORD_SCALE)
     best = None
-    for row in ocrengine.ocr_rows(crop, 2.5):
+    for row in rows:
         text = "".join(s.text for s in row)
         for pat in COORD_RES:
             m = pat.search(text)
@@ -73,19 +77,53 @@ class MailReader:
     # -- 页面状态 ---------------------------------------------------------
     def is_mail_page(self, img: Image.Image | None = None) -> bool:
         img = img or self.adb.screencap()
-        texts = ocrengine.ocr_text(vision.crop(img, (0, 70, 1600, 150)), 2.0)
+        box = config._p((0, 70, 1600, 150), (0, 0, 420, 72))
+        texts = ocrengine.ocr_text(vision.crop(img, box), 2.0)
         return "信件" in texts or "同盟" in texts
+
+    def clear_jump_dialog(self, img: Image.Image | None = None) -> bool:
+        """「是否跳转到坐标」弹框会吃掉所有点击（连邮件图标都点不开）。
+
+        检测到就点「确定」把它关掉。返回是否真的点过。
+        """
+        img = img or self.adb.screencap()
+        box = config.JUMP_DIALOG_BOX
+        scale = 1.6 if config.PORTRAIT else 2.0
+        spans = ocrengine.ocr(vision.crop(img, box), scale)
+        flat = "".join(s.text for s in spans)
+        if "跳转到坐标" not in flat and "是否跳转" not in flat:
+            return False
+        point = config.CONFIRM_JUMP
+        for s in spans:
+            if s.text.replace(" ", "").strip() == "确定":
+                point = (int(box[0] + s.cx), int(box[1] + s.cy))
+                break
+        self.log(f"  ! 弹框「是否跳转到坐标」→ 先点「确定」@{point}")
+        self.adb.tap(*point)
+        time.sleep(1.4)
+        return True
 
     def open(self, wait: float = 2.0, retries: int = 2) -> bool:
         # 已经在邮件页就不要重复点图标（图标是开关，会关掉页面）
-        if self.is_mail_page():
+        img = self.adb.screencap()
+        if self.is_mail_page(img):
             return True
+        if self.clear_jump_dialog(img):
+            img = self.adb.screencap()
+            if self.is_mail_page(img):
+                return True
         for i in range(retries + 1):
             self.adb.tap(*config.MAIL_ICON)
             time.sleep(wait)
             img = self.adb.screencap()
             if self.is_mail_page(img):
                 return True
+            # 点击可能触发了「是否跳转到坐标」弹框（点在坐标文字上），关掉再重试
+            if self.clear_jump_dialog(img):
+                time.sleep(wait)
+                img = self.adb.screencap()
+                if self.is_mail_page(img):
+                    return True
             self.log(f"  邮件页未打开，重试 {i + 1}/{retries}")
         return False
 
@@ -121,7 +159,8 @@ class MailReader:
     def read_body(self, img: Image.Image | None = None) -> MailBody:
         img = img or self.adb.screencap()
         box = config.MAIL_BODY_BOX
-        rows = ocrengine.ocr_rows(vision.crop(img, box), 2.0)
+        rows = ocrengine.ocr_rows(vision.crop(img, box), config.MAIL_OCR_SCALE)
+        title_end, sender_end = config.MAIL_BODY_SPLIT
 
         title, sender, body_lines = "", "", []
         for row in rows:
@@ -129,14 +168,14 @@ class MailReader:
             if not text:
                 continue
             y = box[1] + row[0].cy
-            if y < 245 and not title:
+            if y < title_end and not title:
                 title = text
-            elif 245 <= y < 305 and not sender:
+            elif title_end <= y < sender_end and not sender:
                 sender = text
-            elif y >= 305:
+            elif y >= sender_end:
                 body_lines.append(text)
 
-        coord, point = find_coord_span(img, box)
+        coord, point = find_coord_span(img, box, rows)
         intent = parse_mail(title, sender, "\n".join(body_lines))
         return MailBody(title=title, sender=sender, lines=body_lines,
                         coord_point=point, intent=intent)

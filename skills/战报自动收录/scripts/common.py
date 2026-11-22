@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -37,6 +38,23 @@ WORK_DIR = SKILL_ROOT / "work"
 CAPTURE_ROOT = SKILL_ROOT / "captures"
 CONTROL_DIR = SKILL_ROOT / "control"
 
+def _is_portrait_env() -> bool:
+    """读 SANMOU_ORIENT 或 screenshots/flow/_orientation.json 判断当前方向。"""
+    import os
+    forced = (os.environ.get("SANMOU_ORIENT") or "").strip().lower()
+    if forced in ("portrait", "landscape"):
+        return forced == "portrait"
+    try:
+        cache = (Path(__file__).resolve().parents[4]
+                 / "screenshots" / "flow" / "_orientation.json")
+        data = json.loads(cache.read_text(encoding="utf-8"))
+        return str(data.get("orientation")).lower() == "portrait"
+    except Exception:          # noqa: BLE001 - 无缓存时按横屏
+        return False
+
+
+PORTRAIT = _is_portrait_env()
+
 # 战报页页签（x 比例区间，y 由 targets.tabBand 决定）；顺序与游戏内一致
 TAB_WINDOWS = (
     ("全部", 0.020, 0.190),
@@ -46,7 +64,18 @@ TAB_WINDOWS = (
     ("个人", 0.620, 0.740),
     ("同盟", 0.740, 0.860),
 )
+if PORTRAIT:
+    # 竖屏（900x1600）：页签行在底部 y≈1453，「个人/同盟」是另一行筛选（由 targets.allianceTab 直接点）
+    TAB_WINDOWS = (
+        ("全部", 0.100, 0.190),
+        ("开拓", 0.300, 0.390),
+        ("交战", 0.520, 0.610),
+        ("收藏", 0.740, 0.830),
+    )
 TAB_SELECTED_GOLD = 0.05   # 选中页签金色边框比例下限（实测 0.15~0.18）
+if PORTRAIT:
+    # 竖屏页签更窄，选中态金色比例实测 ≈0.0486（横屏 0.15~0.18）
+    TAB_SELECTED_GOLD = 0.03
 
 DEFAULT_CONFIG: dict = {
     "adbPath": r"C:\Program Files\Netease\MuMu\nx_main\adb.exe",
@@ -61,30 +90,55 @@ DEFAULT_CONFIG: dict = {
         "combatTab": [0.3375, 0.118],       # 战报页「交战」页签（实测中心 540,106）
         "pageBack": [0.056, 0.028],         # 全屏页左上返回箭头（90,25）
         "tabBand": [0.0, 0.075, 1.0, 0.165],  # 页签视觉带（x1,y1,x2,y2 比例）
-        "swipe": {"x": 0.36, "y1": 0.72, "y2": 0.39, "durationMs": 700},
+        # 一次约 240px 手势（实测含惯性滚动 ≈360px < 视口 700px - 卡高 270px = 430px）：
+        # 保证任何一张卡都会在某一屏完整露出来，不会因为步长过大被“跳过”
+        "swipe": {"x": 0.36, "y1": 0.78, "y2": 0.515, "durationMs": 760},
     },
     "expand": {
         "roiX1": 0.900,
         "roiX2": 1.000,          # 金色竖条在 0.9625~0.9906，ROI 必须到屏幕右边缘
         "roiY1": 0.080,
         "roiY2": 0.960,
+        "rightEdgeRatio": 0.945, # 竖条左沿必须贴最右侧（约 x=1540）；卡片金框（x≈1440）一律排除
         "templateScale": 0.9,    # 1600x900 实测（0.8/1.0 都检不到）
         "downThreshold": 0.85,   # 实测 down≈0.965 / up≈0.54；半截卡（0.46）必须排除
         "minMargin": 0.10,
         "minWidth": 14,
-        "maxWidth": 90,
+        "maxWidth": 56,          # 展开条实测宽 45；86 宽的是卡片场次框，误点会进详情页
         "minHeight": 150,        # 完整金色竖条约 216px，底部半截卡约 121px
+        "maxHeight": 240,        # 实测 193~218；放开到 0.55*ROI 会把卡片整框吃进来
+        "clickBottomInset": 26,  # 点击点距竖条底边（箭头双 V 的中心约在 h-28）
         "maxPerPage": 6,
-        "settleMs": 420,
+        "settleMs": 700,         # 点击后等展开动画；实测箭头 <200ms 翻面，但要连同列表一起停稳
+        "retryTries": 1,         # 只有「画面完全没变」才补点一次，且必须用静止后的新坐标
+        "maxRecoveriesPerPage": 2,  # 本页最多容忍 2 次误入详情并回退，避免死循环
+        # 竖条底边 864px（0.96 屏高）实测点击有效；只有更靠底（>0.955）才先上滑
+        "bottomSafeRatio": 0.955,
+        "cutRatio": 0.97,        # 竖条被屏幕底边截断（y+h 超过该比例）先上滑
+        "finalSettleMs": 350,    # 本页展开完再等列表稳定，随后才滑动
     },
     "ports": {"fallback": [20020, 20050, 20060, 20090], "min": 10000, "max": 65535},
     "capture": {
         "pageDelayMs": 900,
         "swipeDelayMs": 700,
-        "maxPages": 60,
-        "stalledPagesToStop": 2,
+        # 0 = 不设页数上限，必须连续多屏无变化（list_end）才结束一轮
+        "maxPages": 0,
+        "hardMaxPages": 500,       # 仅防界面异常死循环的安全上限
+        "stalledPagesToStop": 2,   # 连续两屏滑不动 = 到底（每屏内部已含一次换手势重试）
+        "stalledProbeDelayMs": 1500,  # 判“滑不动”前再等一次，排除列表仍在加载
+        # 游戏偶尔会吞掉滑动（实测 40 次里 4 次“假到底”）：换更低/更慢/更长的第二次手势
+        "swipeRetryY1": 0.84,
+        "swipeRetryY2": 0.60,
+        "swipeRetryDurationMs": 800,
+        "requireListEnd": True,    # production 没翻到底 -> 保留 capture 但拒绝上传
         "visualDiffMean": 3.0,
         "changedRatio": 0.03,
+        # 滑动/展开之后列表还会因为懒加载和惯性继续上顶 1.3~1.6s（实测 y 从 363 走到 284）。
+        # 必须等「连续两帧几乎一致」再取点击坐标，否则落点会偏下 40~90px 点进战报详情页。
+        "stableTimeoutMs": 2600,      # 等列表静止的最长时间
+        "stableIntervalMs": 180,      # 静止检测的采样间隔
+        "stableDiffMean": 0.9,        # 两帧平均差 <= 该值视为静止（实测静止≈0.05）
+        "stableChangedRatio": 0.002,  # 两帧变化像素比例上限（实测静止≈0.000）
         "navigateRetries": 3,
         "tabsTimeoutMs": 4000,
         # 已经在战报页时先返回再重新进入：否则列表不重新请求，pcap 里没有战报帧
@@ -94,8 +148,39 @@ DEFAULT_CONFIG: dict = {
     "server": {
         "configPath": "control/server_upload.json",
         "baseUrl": "",
-        "waitVisibleSeconds": 180,
+        # 服务器有 180s 发布静默窗口 + 约 120s 构建，180s 必然超时
+        "waitVisibleSeconds": 900,
         "pollSeconds": 5,
+    },
+}
+
+# 900x1600 竖屏实测覆盖（2026-11-21，见 plans/竖屏适配.md）
+# 竖屏是重排布局：战报入口在左下交叉剑，页签行在底部，卡片 4 条/屏。
+PORTRAIT_CONFIG: dict = {
+    "screen": {"width": 900, "height": 1600},
+    "targets": {
+        "reportEntry": [0.420, 0.823],      # 主界面左下「军报」≈ (378,1317)
+        "allianceTab": [0.613, 0.964],      # 底部筛选「同盟」≈ (552,1542)
+        "combatTab": [0.561, 0.908],        # 页签「交战」≈ (505,1453)
+        "pageBack": [0.159, 0.965],         # 底部「返回」≈ (143,1544)
+        "tabBand": [0.0, 0.895, 1.0, 0.925],
+        "swipe": {"x": 0.50, "y1": 0.78, "y2": 0.55, "durationMs": 760},
+    },
+    "expand": {
+        "roiX1": 0.930,
+        "roiX2": 1.000,
+        "roiY1": 0.060,
+        "roiY2": 0.920,
+        # 竖屏实测（2026-11-22，900x1600）：折叠卡右侧金色竖条 x≈837..875：
+        # 左沿 837/900≈0.930，用 0.965 会把它整体排除（表现为 expandedCards=0）。
+        "rightEdgeRatio": 0.920,
+        "minWidth": 10,
+        "maxWidth": 45,
+        "minHeight": 100,
+        # 「连战 N 场」折叠竖条实测高 311px（原上限 260 会把所有竖条漏检）
+        "maxHeight": 420,
+        "clickBottomInset": 20,
+        "maxPerPage": 8,
     },
 }
 
@@ -127,6 +212,9 @@ def load_config(path: str | Path | None = None) -> dict:
             loaded = json.loads(Path(candidate).read_text(encoding="utf-8-sig"))
             _deep_merge(config, loaded)
             break
+    if PORTRAIT:
+        # 方向 profile 必须最后应用：skill 目录里的 config.json 仍是横屏基准值
+        _deep_merge(config, copy.deepcopy(PORTRAIT_CONFIG))
     if config.get("python") == "":
         config["python"] = sys.executable
     return config
@@ -190,6 +278,30 @@ class Adb:
             [self.adb_path, "devices"], capture_output=True, check=False,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         ).stdout.decode("utf-8", "ignore")
+
+    def exit_dialog_visible(self) -> bool:
+        """是否弹出「确认退出游戏」（com.gsc.exit.ExitActivity，按 BACK 会触发）。"""
+        out = self.run(["shell", "dumpsys", "window", "windows"],
+                       allow_failure=True, timeout=20)
+        return "ExitActivity" in out
+
+    def cancel_exit_dialog(self) -> bool:
+        """点「取消」关掉「确认退出游戏」，绝不点「确定」。"""
+        point = (716, 494)          # 1600x900 兜底坐标
+        try:
+            self.run(["shell", "uiautomator", "dump", "/sdcard/ui_exit.xml"],
+                     allow_failure=True, timeout=30)
+            xml = self.run(["shell", "cat", "/sdcard/ui_exit.xml"],
+                           allow_failure=True, timeout=20)
+            matched = re.search(
+                r'tv_gs_exit_cancel[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"', xml)
+            if matched:
+                x1, y1, x2, y2 = (int(v) for v in matched.groups())
+                point = ((x1 + x2) // 2, (y1 + y2) // 2)
+        except Exception:               # noqa: BLE001
+            pass
+        self.tap(*point, wait_ms=1200)
+        return not self.exit_dialog_visible()
 
     def ensure_online(self) -> None:
         if self.serial not in self.devices():
@@ -341,6 +453,24 @@ def page_state(path: str | Path, config: dict) -> dict:
     state["dialogOverlay"] = bool(engine.get("dialogOverlay"))
     state["orientation"] = engine.get("orientation")
     return state
+
+
+def map_visible(path: str | Path, config: dict) -> bool:
+    """OCR 底栏「武将/同盟/征战」判断是否已回到世界地图。
+
+    技能自带的模板 `mainScreen` 在实战界面会误判（地图上为 false、
+    战报页反而为 true），所以回图判定一律以底栏 OCR 为准。
+    """
+    try:
+        image = load_color(path)
+        height, width = image.shape[:2]
+        crop = image[int(0.867 * height):int(0.989 * height),
+                     int(0.375 * width):int(0.9125 * width)]
+        text = _ocr_text(crop)
+    except Exception:               # noqa: BLE001
+        return False
+    flat = text.replace(" ", "").replace("证战", "征战")
+    return ("武将" in flat or "同盟" in flat) and "征战" in flat
 
 
 def pixels(target: list[float], width: int, height: int) -> tuple[int, int]:

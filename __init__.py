@@ -5,4 +5,7 @@
 - 每个功能单独设计、单独验证
 """
 
-__all__ = ["config", "adb", "vision", "ocrengine", "intent", "mail", "mapnav"]
+from . import _nowin  # noqa: F401  导入即启用「子进程不弹 CMD 框」
+
+__all__ = ["config", "adb", "vision", "ocrengine", "intent", "mail", "mapnav",
+           "report_collector", "flow_line_report", "_nowin"]

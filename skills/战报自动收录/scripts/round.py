@@ -1,13 +1,15 @@
 """战报自动收录 · 一条命令跑完一轮：采集 → 提取 → 上传 → 等可见 → 汇总。
 
-一轮 = 打开「战报 → 同盟 → 交战」→ 逐卡展开 → 滑到底（连续两页无变化）
-     → 停 tcpdump → pcap 提 BLOB → 增量上传 → 等 /api/live 可见。
+一轮 = 打开「战报 → 同盟 → 交战」→ 逐卡展开 → 一直滑到列表真正到底
+     （连续多屏画面不再变化）→ 停 tcpdump → pcap 提 BLOB → 增量上传 → 等 /api/live 可见。
+     没滑到底的采集不算完成：production 会保留 capture 但拒绝上传。
 
 用法：
-    python scripts/round.py                       # 生产抓取 + 上传 + 等可见
-    python scripts/round.py --kind diagnostic     # 只抓本地、不上传
-    python scripts/round.py --max-pages 3 --max-seconds 300
+    python scripts/round.py                       # 生产抓取（翻到列表底）+ 上传 + 等可见
+    python scripts/round.py --kind diagnostic     # 只抓本地、不上传（同样翻到底）
+    python scripts/round.py --max-seconds 1800
     python scripts/round.py --skip-upload
+    # --max-pages 仅冒烟/校准；>0 会让本轮不完整而无法上传
 """
 from __future__ import annotations
 
@@ -28,11 +30,22 @@ def run_round(config: dict, *, kind: str, max_pages: int | None, max_seconds: in
     started = time.time()
     summary: dict = {"ok": False, "kind": kind, "startedAt": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
 
-    captured = capture.run_capture(
-        config, kind=kind, max_pages=max_pages, max_seconds=max_seconds, expand=expand,
-    )
+    try:
+        captured = capture.run_capture(
+            config, kind=kind, max_pages=max_pages, max_seconds=max_seconds, expand=expand,
+        )
+    except Exception as error:  # noqa: BLE001 - 未翻到底/设备异常都算本步失败
+        summary.update({"failedStep": "capture", "reason": type(error).__name__,
+                        "error": str(error)})
+        return _finish(summary, started)
     summary["capture"] = captured
     summary["captureId"] = captured["captureId"]
+    summary["captureComplete"] = bool(captured.get("complete"))
+    if (kind == "production" and not summary["captureComplete"]
+            and bool(config["capture"].get("requireListEnd", True))):
+        summary.update({"failedStep": "capture", "reason": "incomplete-list",
+                        "error": "列表未翻到底，本轮不算完成"})
+        return _finish(summary, started)
 
     extracted = extract.extract_capture(config, captured["captureDir"])
     summary["extract"] = extracted
@@ -51,6 +64,11 @@ def run_round(config: dict, *, kind: str, max_pages: int | None, max_seconds: in
     if not uploaded.get("ok"):
         summary["ok"] = False
         summary["failedStep"] = "upload"
+        return _finish(summary, started)
+    if uploaded.get("nothingNew"):
+        # 列表翻到底了但服务器已有全部 BLOB：本轮成功，无需等可见。
+        summary["ok"] = True
+        summary["skipped"] = "no-new-blobs"
         return _finish(summary, started)
 
     if wait_visible:
@@ -81,8 +99,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="")
     parser.add_argument("--kind", choices=("production", "diagnostic"), default="production")
-    parser.add_argument("--max-pages", type=int, default=0)
-    parser.add_argument("--max-seconds", type=int, default=1800)
+    parser.add_argument("--max-pages", type=int, default=0,
+                        help="仅调试用；>0 会提前停止，使本轮不完整而无法上传")
+    parser.add_argument("--max-seconds", type=int, default=3600)
     parser.add_argument("--no-expand", action="store_true")
     parser.add_argument("--skip-upload", action="store_true")
     parser.add_argument("--no-wait", action="store_true")
