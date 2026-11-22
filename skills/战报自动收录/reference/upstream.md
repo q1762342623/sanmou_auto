@@ -17,8 +17,8 @@ scripts/engine/detect_expand_arrow.py            箭头模板打分（本项目�
 scripts/engine/inspect_mumu_ui.py                页面状态检测（页签/遮挡/画面差异）
 scripts/reference/tool_contract.json             tool_contract.py 按 parents[1]/reference 读取，故放这里
 reference/tool_contract.json                     同上（便于人工查看）
-reference/ui_templates/expand_down.png           展开条模板（向下箭头＝折叠）
-reference/ui_templates/expand_up.png             展开条模板（向上箭头＝已展开）
+reference/ui_templates/*.png                      可选本地模板覆盖（仓库不提交图片；
+                                                  默认用 scripts/engine/arrow_templates.py 内嵌数据）
 reference/current_report_era.json                统计时代表（每轮采集前会从服务器同步覆盖）
 ```
 
@@ -37,6 +37,7 @@ copy /Y "$src\reference\tool_contract.json"              "skills\战报自动收
 copy /Y "$src\reference\tool_contract.json"              "skills\战报自动收录\reference\"
 copy /Y "$src\scripts\detect_expand_arrow.py"            "skills\战报自动收录\scripts\engine\"
 copy /Y "$src\scripts\inspect_mumu_ui.py"                "skills\战报自动收录\scripts\engine\"
+# 可选：仅当要替换内嵌模板时执行（替换后需重新生成 engine/arrow_templates.py 的内嵌数据）
 copy /Y "$src\reference\ui_templates\expand_down.png"    "skills\战报自动收录\reference\ui_templates\"
 copy /Y "$src\reference\ui_templates\expand_up.png"      "skills\战报自动收录\reference\ui_templates\"
 ```

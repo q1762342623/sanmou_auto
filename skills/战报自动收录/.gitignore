@@ -8,6 +8,10 @@ control/server_upload.json
 control/server_upload_secret.txt
 control/mumu_*.json
 
+# 仓库不提交图片：箭头模板已内嵌到 scripts/engine/arrow_templates.py；
+# 本地放 reference/ui_templates/*.png 仅用于现场替换模板，不随仓库提交。
+reference/ui_templates/
+
 # Python
 __pycache__/
 *.py[cod]

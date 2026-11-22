@@ -39,10 +39,20 @@ def run_checks(config: dict) -> dict:
     add(checks, "engine-modules", not missing,
         f"缺少 {missing}" if missing else str(common.ENGINE_DIR))
 
-    templates = [name for name in ("expand_down.png", "expand_up.png")
-                 if not (common.TEMPLATES_DIR / name).is_file()]
-    add(checks, "ui-templates", not templates,
-        f"缺少 {templates}" if templates else str(common.TEMPLATES_DIR))
+    # 仓库不保存图片：模板默认从 engine/arrow_templates.py 内嵌数据解码；
+    # 本地若放了 reference/ui_templates/*.png 则优先用文件（现场替换模板）。
+    embedded = True
+    try:
+        from engine import arrow_templates
+        embedded = all(arrow_templates.load_gray(name).size > 0
+                       for name in ("expand_down.png", "expand_up.png"))
+    except Exception:  # noqa: BLE001
+        embedded = False
+    files = [name for name in ("expand_down.png", "expand_up.png")
+             if (common.TEMPLATES_DIR / name).is_file()]
+    add(checks, "ui-templates", embedded,
+        ("内嵌模板可用" + (f"；本地覆盖 {files}" if files else ""))
+        if embedded else "缺少内嵌模板 engine/arrow_templates.py")
 
     python = common.which_python(config)
     modules = {"cv2": False, "numpy": False, "PIL": False, "dpkt": False}

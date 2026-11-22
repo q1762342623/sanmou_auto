@@ -22,6 +22,20 @@ def _arrows():
     return common.load_engine("detect_expand_arrow")
 
 
+def _load_template(name: str, scale: float) -> np.ndarray:
+    """加载箭头模板：本地有 PNG 就用 PNG（方便现场替换），否则用内嵌数据。
+
+    仓库不保存图片，模板以 zlib+base64 内嵌在 `engine/arrow_templates.py`，
+    解码后的灰度数组与原 PNG 完全一致。
+    """
+    arrows = _arrows()
+    path = common.TEMPLATES_DIR / name
+    if path.is_file():
+        return arrows.scale_template(arrows.load_gray(str(path)), scale)
+    from engine import arrow_templates
+    return arrows.scale_template(arrow_templates.load_gray(name), scale)
+
+
 def _arrow_center(patch: np.ndarray, template: np.ndarray) -> tuple[int, int, float] | None:
     """在竖条 patch 内定位底部箭头 glyph，返回相对 patch 左上角的中心与匹配分数。"""
     if patch.size == 0 or template.size == 0:
@@ -71,10 +85,8 @@ def detect_strips(image, config: dict) -> dict:
 
     arrows = _arrows()
     scale = float(expand["templateScale"])
-    down_template = arrows.scale_template(
-        arrows.load_gray(str(common.TEMPLATES_DIR / "expand_down.png")), scale)
-    up_template = arrows.scale_template(
-        arrows.load_gray(str(common.TEMPLATES_DIR / "expand_up.png")), scale)
+    down_template = _load_template("expand_down.png", scale)
+    up_template = _load_template("expand_up.png", scale)
     down_threshold = float(expand["downThreshold"])
     min_margin = float(expand["minMargin"])
     min_width = int(expand.get("minWidth", 14))

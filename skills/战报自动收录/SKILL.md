@@ -179,7 +179,8 @@ python scripts/upload.py --capture-id <captureId>
   [`reference/upstream.md`](reference/upstream.md)）
 - `scripts/arrow_detect.py`：金色竖条 + 箭头方向检测（本项目按 1600x900 重写）
 - `scripts/common.py`：`tab_status()` / `page_state()`（OCR + 金色边框的战报页判定）
-- `reference/ui_templates/expand_down.png` / `expand_up.png`：右侧金色展开条模板
+- 展开条模板：内嵌在 `scripts/engine/arrow_templates.py`（zlib+base64，**仓库不提交图片**）；
+  本地若放 `reference/ui_templates/expand_*.png` 会优先使用（方便现场替换）
 - `reference/current_report_era.json`：统计时代表；`report.reportEra:"auto"` 时取最新，
   且每轮采集前会先从服务器 `/api/report-era-schedule` 同步
 - `captures/<captureId>/`：`game_traffic.pcap`、`blobs/`、`capture_metadata.json`、截图、`tcpdump.log`
