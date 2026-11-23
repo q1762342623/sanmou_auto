@@ -37,10 +37,11 @@ adb 截图/触控 ─┐
 | `python scripts/doctor.py` | 环境自检：引擎/模板/依赖/adb/root/tcpdump/上传配置/服务器 `/api/live` |
 | `python scripts/screen.py preview` | 把比例目标画到当前截图上，用于首次校准 |
 | `python scripts/screen.py state` | 输出当前页面状态（页签是否可见、交战是否选中、是否被弹窗遮挡） |
-| `python scripts/round.py` | **一条命令跑完一轮**：采集 → 提取 → 上传 → 等可见 |
+| `python scripts/round.py` | **一条命令跑完一轮**：采集 → 提取 → 上传 → 等可见；同时输出交战坐标热点 |
 | `python scripts/capture.py --kind production` | 只采集（不提取、不上传） |
 | `python scripts/extract.py --capture-dir <dir>` | 只对已有 capture 做提取与质量门槛 |
 | `python scripts/upload.py --capture-id <id>` | 只上传指定 capture 并等可见 |
+| `python scripts/coordinate_stats.py` | 只汇总「本次进入战报→拉到底」的 capture 坐标，输出最高交战频率点（含已提交过的战报，不累计历史） |
 
 ## 1. 前置检查（每次开工做一次）
 
@@ -137,6 +138,16 @@ python scripts/round.py
 `pages` 是真正滑动的次数，`screens` 是处理过的屏数（含最后两屏“滑不动”的确认）。
 `--max-pages` 只用于冒烟/校准，任何 >0 的值都会让本轮 `complete:false`、无法上传。
 上传成功后回执里 `ingestVersion` 必须为正；等可见时再比对 `/api/live.visibleIngestVersion`。
+`--allow-partial`：没翻到 `list_end` 也继续上传（整合调度器 `report_collector` 使用，
+服务器按 BLOB 增量去重；独立跑默认严格，必须有 `list_end`）。
+
+采集性能与完整性（2026-11-23 优化后）：
+
+- 截图走设备 raw（`screencap` 不带 `-p`，约 0.24s/帧；旧 PNG 约 0.65s/帧），帧在内存里复用，只有留证帧才写 PNG；`capture.visualTiming` 给出 `frames / frameSeconds / avgFrameMs / expandSeconds / swipeSeconds / pageAvgSeconds`。
+- 展开/收起统一用「整屏静止帧 + 箭头 up/down」双确认（`expand.openConfirmMs` / `closeConfirmMs`），去掉重复等待；默认逐卡处理（`burstTap=false`）。
+- 每屏收尾都用新帧审计：`pageLog[].leftoverDowns > 0` 表示还有未展开的完整卡片（正常为 0）；`leftoverUps > 0` 表示遗留展开态，二者都会兜底处理。
+- 历史遗留的展开卡会先收起再重新展开，确保本轮 tcpdump 窗口内重新下发详情（`pageLog[].preCollapsed`）。
+- `capture.requireListEnd=true`（默认）：没滑到 `list_end` 的 production capture 会写 `incomplete.json` 并拒绝上传，避免半轮数据被当成完整战报。
 
 ### 3.1 只抓不传（诊断）
 
@@ -186,6 +197,7 @@ python scripts/upload.py --capture-id <captureId>
 - `captures/<captureId>/`：`game_traffic.pcap`、`blobs/`、`capture_metadata.json`、截图、`tcpdump.log`
 - `work/rounds/round_*.json`：每轮汇总（含耗时、页数、展开数、停止原因）
 - `work/server_upload_state.json`：上传断点（按 capture 记 `maxBlobSeq` / `ingestVersion`）
+- `work/latest_hotspot.json` / `work/latest_hotspot.txt`：本次 capture 汇总出的最高交战频率点
 
 ## 6. 边界与约束
 
@@ -206,4 +218,14 @@ python scripts/upload.py --capture-id <captureId>
 
 - `ok:true` → 本轮完成，报告 `capture.pages`、`capture.expandedCards`、
   `extract.uniqueBlobs`、`extract.completeRecords`、`visibility.visibleIngestVersion`
+- `coordinateHotspot` → **只统计本轮 capture** 的交战坐标热点
+  （本轮 = 本次从进入战报到拉到底抓到的全部战报，含之前已提交过的战报；
+  与上传状态、历史 capture 无关）：
+  - `scope:"round"`、`captureId`、`captureKind`、`reportEra`；
+  - `records`：本轮解出的完整战报记录数（含分页重复带回）；
+  - `battles`：本轮内去重后的战报场次总数；`duplicates`：两者之差；
+  - `hottest` / `top[]`：`x`、`y`、`count`（该点战报场次）、`share`（占比）。
+  同时会覆盖写 `work/latest_hotspot.json` 与 `work/latest_hotspot.txt`
+  （格式 `x,y,count,share`），并在 stderr 打一行 `[交战热点] ...`
+  （stdout 最后一行仍是本轮 JSON）。
 - `ok:false` → 报告 `failedStep` / `reason` / `error`，并按 §4 给出下一步建议

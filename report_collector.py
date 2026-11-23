@@ -40,7 +40,9 @@ SUBMIT_INTERVAL_SECONDS = 600.0
 # 收集间隔只有下限。MAX_INTERVAL_SECONDS 仅用于状态文件/报表展示，**不做任何强制压缩**
 MAX_INTERVAL_SECONDS = 24 * 3600.0
 # 最小间隔（秒）：防止误把间隔调成 0 后疯狂抓包
-MIN_INTERVAL_SECONDS = 60.0
+# 2026-11-23 下调到 30s：同盟「交战」列表只保留约 6~10 分钟的滚动窗口，
+# 实测约 10 张/分钟，必须每 3~5 分钟扫完一轮才能不漏（参考 list_card_team_stats）。
+MIN_INTERVAL_SECONDS = 30.0
 # 状态文件的有效期（秒）：太久的记录不再用来计算间隔
 STATE_MAX_AGE_SECONDS = 30 * 24 * 3600
 
@@ -361,6 +363,12 @@ class ReportCollector:
                 self.log(f"[战报收集 #{index}] 完成：页 {pages} / BLOB {blobs} / "
                          f"记录 {records} / 上传 {upload_text}"
                          f"（用时 {fmt_seconds(result['collectSeconds'])}）")
+                hotspot = ((result.get("coordinateHotspot") or {}).get("hottest")
+                           or {})
+                if hotspot:
+                    self.log(f"  [交战热点] ({hotspot.get('x')},{hotspot.get('y')}) "
+                             f"{hotspot.get('count')}场 "
+                             f"{float(hotspot.get('share') or 0) * 100:.1f}%")
             else:
                 self.failures += 1
                 detail = " ".join(str(x) for x in (
@@ -437,7 +445,7 @@ class ReportCollector:
         if not script.is_file():
             raise FileNotFoundError(f"找不到战报收集脚本：{script}")
         args = [self.python, str(script), "--max-seconds", str(int(self.max_seconds)),
-                "--no-wait"]
+                "--no-wait", "--allow-partial"]
         if skip_upload:
             args.append("--skip-upload")
         code, out, err = self._exec(args, timeout=self.max_seconds + self.timeout_extra)
@@ -453,6 +461,7 @@ class ReportCollector:
         return {
             "ok": bool(round_result.get("ok")),
             "captureId": round_result.get("captureId"),
+            "coordinateHotspot": round_result.get("coordinateHotspot"),
             "pages": captured.get("pages"),
             "expandedCards": captured.get("expandedCards"),
             "captureComplete": round_result.get("captureComplete"),

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from pathlib import Path
 
@@ -22,7 +23,8 @@ import common
 
 
 def run_round(config: dict, *, kind: str, max_pages: int | None, max_seconds: int,
-              expand: bool, skip_upload: bool, wait_visible: bool) -> dict:
+              expand: bool, skip_upload: bool, wait_visible: bool,
+              allow_partial: bool = False) -> dict:
     import capture
     import extract
     import upload
@@ -30,9 +32,12 @@ def run_round(config: dict, *, kind: str, max_pages: int | None, max_seconds: in
     started = time.time()
     summary: dict = {"ok": False, "kind": kind, "startedAt": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
 
+    require_list_end = (bool(config["capture"].get("requireListEnd", True))
+                        and not allow_partial)
     try:
         captured = capture.run_capture(
-            config, kind=kind, max_pages=max_pages, max_seconds=max_seconds, expand=expand,
+            config, kind=kind, max_pages=max_pages, max_seconds=max_seconds,
+            expand=expand, require_list_end=require_list_end,
         )
     except Exception as error:  # noqa: BLE001 - 未翻到底/设备异常都算本步失败
         summary.update({"failedStep": "capture", "reason": type(error).__name__,
@@ -41,8 +46,7 @@ def run_round(config: dict, *, kind: str, max_pages: int | None, max_seconds: in
     summary["capture"] = captured
     summary["captureId"] = captured["captureId"]
     summary["captureComplete"] = bool(captured.get("complete"))
-    if (kind == "production" and not summary["captureComplete"]
-            and bool(config["capture"].get("requireListEnd", True))):
+    if kind == "production" and not summary["captureComplete"] and require_list_end:
         summary.update({"failedStep": "capture", "reason": "incomplete-list",
                         "error": "列表未翻到底，本轮不算完成"})
         return _finish(summary, started)
@@ -53,6 +57,24 @@ def run_round(config: dict, *, kind: str, max_pages: int | None, max_seconds: in
         summary["ok"] = False
         summary["failedStep"] = "extract"
         return _finish(summary, started)
+
+    # 交战坐标热点：只统计本轮 capture（进入战报→拉到底抓到的全部战报，
+    # 含之前已提交过的战报），不累计历史、不看上传状态
+    coordinates = config.get("coordinates") or {}
+    if bool(coordinates.get("enabled", True)):
+        try:
+            import coordinate_stats
+
+            hotspot = coordinate_stats.summarize_capture(
+                config,
+                captured["captureDir"],
+                top_n=int(coordinates.get("topN", 10)),
+            )
+            summary["coordinateHotspot"] = hotspot
+            print(coordinate_stats.human_line(hotspot), file=sys.stderr)
+        except Exception as error:  # noqa: BLE001 - 热点失败不影响采集/上传
+            summary["coordinateHotspot"] = {
+                "ok": False, "reason": type(error).__name__, "error": str(error)}
 
     if skip_upload or kind != "production":
         summary["ok"] = True
@@ -105,6 +127,9 @@ def main() -> int:
     parser.add_argument("--no-expand", action="store_true")
     parser.add_argument("--skip-upload", action="store_true")
     parser.add_argument("--no-wait", action="store_true")
+    parser.add_argument(
+        "--allow-partial", action="store_true",
+        help="没翻到列表底也继续上传（整合调度器用；服务器按 BLOB 增量去重）")
     args = parser.parse_args()
     config = common.load_config(args.config or None)
     try:
@@ -115,6 +140,7 @@ def main() -> int:
             expand=not args.no_expand,
             skip_upload=args.skip_upload,
             wait_visible=not args.no_wait,
+            allow_partial=args.allow_partial,
         )
     except Exception as error:  # noqa: BLE001
         result = {"ok": False, "reason": type(error).__name__, "error": str(error)}

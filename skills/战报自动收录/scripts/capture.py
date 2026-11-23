@@ -87,57 +87,89 @@ def stop_tcpdump(adb: common.Adb, handle: dict) -> None:
 # --------------------------------------------------------------------------- #
 # 导航
 # --------------------------------------------------------------------------- #
-def _state(path: Path, config: dict | None = None) -> dict:
+# 帧统计：只用于本轮性能报告（screencap 次数 / 总耗时），不影响采集逻辑
+_FRAME_STATS = {"frames": 0, "seconds": 0.0}
+
+
+def _reset_frame_stats() -> None:
+    _FRAME_STATS["frames"] = 0
+    _FRAME_STATS["seconds"] = 0.0
+
+
+def grab(adb: common.Adb):
+    """抓一帧 BGR（设备 raw，实测约 0.24s），并累计帧数与耗时。"""
+    started = time.perf_counter()
+    image = adb.grab()
+    _FRAME_STATS["frames"] += 1
+    _FRAME_STATS["seconds"] += time.perf_counter() - started
+    return image
+
+
+def frame_stats() -> dict:
+    frames = int(_FRAME_STATS["frames"])
+    seconds = round(float(_FRAME_STATS["seconds"]), 2)
+    return {"frames": frames, "frameSeconds": seconds,
+            "avgFrameMs": round(seconds * 1000.0 / frames, 1) if frames else 0.0}
+
+
+def _state(image, config: dict | None = None) -> dict:
     if config is None:
-        return common.inspect_screenshot(path)
-    return common.page_state(path, config)
+        return common.inspect_screenshot(image)
+    return common.page_state(image, config)
 
 
-def open_combat_list(adb: common.Adb, config: dict, targets: dict, shot: Path) -> dict:
-    """从主界面/城内（或战报页）进入「交战」列表；返回最后一次截图与状态。"""
+def open_combat_list(adb: common.Adb, config: dict, targets: dict,
+                     blocked_dir: Path | None = None) -> tuple[dict, object]:
+    """从主界面/城内（或战报页）进入「交战」列表；返回 (info, frame)。"""
     capture = config["capture"]
     retries = int(capture["navigateRetries"])
     tabs_timeout = int(capture["tabsTimeoutMs"]) / 1000.0
     page_delay = int(capture["pageDelayMs"]) / 1000.0
-    width, height = adb.screenshot(shot)
+    frame = grab(adb)
+    height, width = frame.shape[:2]
     last_error = ""
     for attempt in range(1, retries + 1):
-        state = _state(shot, config)
+        state = _state(frame, config)
         if state.get("blockingOverlay"):
-            shot.with_name(f"screen_blocked_{attempt}.png").write_bytes(shot.read_bytes())
+            if blocked_dir is not None:
+                common.save_color(frame, blocked_dir / f"screen_blocked_{attempt}.png")
             last_error = "blocking-overlay"
             adb.tap(*targets["pageBack"], wait_ms=800)
-            adb.screenshot(shot)
+            frame = grab(adb)
             continue
         if not state.get("reportPage"):
             adb.tap(*targets["reportEntry"], wait_ms=400)
-            ready = common.wait_until(
-                lambda: _state(shot, config).get("reportPage"),
-                tabs_timeout, 0.5,
-            )
+            ready = False
+            deadline = time.time() + tabs_timeout
+            while time.time() < deadline:
+                frame = grab(adb)
+                state = _state(frame, config)
+                if state.get("reportPage"):
+                    ready = True
+                    break
+                time.sleep(0.4)
             if not ready:
-                adb.screenshot(shot)
                 last_error = "report-page-not-visible"
                 continue
         if state.get("combatTabSelected"):
-            wait_still(adb, config, shot)
-            state = _state(shot, config)
-            return {"ok": True, "attempt": attempt, "path": str(shot),
-                    "width": width, "height": height, "state": state}
+            _, frame = wait_still(adb, config)
+            state = _state(frame, config)
+            return ({"ok": True, "attempt": attempt, "width": width,
+                     "height": height, "state": state}, frame)
         # 上游习惯先点「同盟」再点「交战」；两页签互斥，最终状态以「交战」为准
         if target_is_alliance(config):
             adb.tap(*targets["allianceTab"], wait_ms=page_delay * 1000)
         for tab_try in range(1, 3):
             adb.tap(*targets["combatTab"], wait_ms=page_delay * 1000)
-            adb.screenshot(shot)
-            state = _state(shot, config)
+            frame = grab(adb)
+            state = _state(frame, config)
             if state.get("combatTabSelected"):
                 # 切页签后列表还在做进场动画，等静止再交给展开逻辑
-                wait_still(adb, config, shot)
-                state = _state(shot, config)
-                return {"ok": True, "attempt": attempt, "path": str(shot),
-                        "width": width, "height": height, "state": state,
-                        "combatTabTries": tab_try}
+                _, frame = wait_still(adb, config)
+                state = _state(frame, config)
+                return ({"ok": True, "attempt": attempt, "width": width,
+                         "height": height, "state": state,
+                         "combatTabTries": tab_try}, frame)
         last_error = (f"combat-tab-not-selected(selected={state.get('selectedTab')!r}, "
                       f"gold={state.get('tabGold')}, ocr={state.get('tabOcrText')!r})")
     raise RuntimeError(f"进入交战列表失败：{last_error}")
@@ -150,10 +182,10 @@ def target_is_alliance(config: dict) -> bool:
 # --------------------------------------------------------------------------- #
 # 展开 / 滑动
 # --------------------------------------------------------------------------- #
-def detect_arrows(path: Path, config: dict) -> dict:
+def detect_arrows(image, config: dict) -> dict:
     import arrow_detect
 
-    return arrow_detect.detect_strips(common.load_color(path), config)
+    return arrow_detect.detect_strips(common.to_color(image), config)
 
 
 def _same_strip(a: dict, b: dict) -> bool:
@@ -183,45 +215,39 @@ def _is_still(diff: dict, capture: dict) -> bool:
                 and diff["changedRatio"] <= float(capture.get("stableChangedRatio", 0.002)))
 
 
-def wait_still(adb: common.Adb, config: dict, shot: Path,
+def wait_still(adb: common.Adb, config: dict, start=None,
                timeout_ms: int | None = None,
-               interval_ms: int | None = None) -> bool:
-    """等到「连续两帧几乎一样」为止，并把这张稳定帧写回 shot。
+               interval_ms: int | None = None) -> tuple[bool, object]:
+    """等到「连续两帧几乎一样」为止，返回 (still, frame)。
 
     为什么必须等：`input swipe` 结束后列表还会因为图片懒加载/惯性继续上顶
     1.3~1.6s（实测竖条 y 从 363 一路走到 284）。若拿没停稳的截图算点击坐标，
     落点会整体偏下 40~90px，正好压到卡片本体 —— 也就是「误进战报详情页」。
+
+    优化（2026-11-23）：
+    1. 帧全部在内存里走 raw screencap，不再每帧写/删临时 PNG；
+    2. 支持传入 `start`（刚抓到的帧），省掉一次截图；
+    3. 调用方拿到返回帧后可直接复用，避免重复解码/重复截图。
     """
     capture = config["capture"]
     timeout = max(0.3, float(timeout_ms if timeout_ms is not None
                              else capture.get("stableTimeoutMs", 2600)) / 1000.0)
     interval = max(0.05, float(interval_ms if interval_ms is not None
                                else capture.get("stableIntervalMs", 180)) / 1000.0)
-    first = shot.with_name(shot.stem + "_still_a.png")
-    second = shot.with_name(shot.stem + "_still_b.png")
-    adb.screenshot(first)
+    first = start if start is not None else grab(adb)
     started = time.time()
-    still = False
     while True:
         time.sleep(interval)
-        adb.screenshot(second)
+        second = grab(adb)
         if _is_still(common.visual_difference(first, second), capture):
-            still = True
-            break
+            return True, second
         if time.time() - started >= timeout:
-            break
-        first.write_bytes(second.read_bytes())
-    shot.write_bytes(second.read_bytes())
-    for temp in (first, second):
-        try:
-            temp.unlink()
-        except OSError:
-            pass
-    return still
+            return False, second
+        first = second
 
 
-def _recover_to_list(adb: common.Adb, config: dict, shot: Path,
-                     targets: dict, tries: int = 3) -> bool:
+def _recover_to_list(adb: common.Adb, config: dict, frame,
+                     targets: dict, tries: int = 3) -> tuple[bool, object]:
     """从战果详情页回到交战列表：先点左上返回，无效再用系统 BACK 兜底。
 
     注意 1：详情页打开动画未结束时点击会被吞掉，所以左上返回要重试；
@@ -232,21 +258,21 @@ def _recover_to_list(adb: common.Adb, config: dict, shot: Path,
         if adb.exit_dialog_visible():
             adb.cancel_exit_dialog()
         adb.tap(*targets["pageBack"], wait_ms=1300)
-        adb.screenshot(shot)
-        if _state(shot, config).get("reportPage"):
-            return True
+        frame = grab(adb)
+        if _state(frame, config).get("reportPage"):
+            return True, frame
         time.sleep(0.4)
     adb.shell("input", "keyevent", "4")
     time.sleep(1.2)
     if adb.exit_dialog_visible():
         adb.cancel_exit_dialog()
-    adb.screenshot(shot)
-    return bool(_state(shot, config).get("reportPage"))
+    frame = grab(adb)
+    return bool(_state(frame, config).get("reportPage")), frame
 
 
-def _judge_tap(adb: common.Adb, config: dict, shot: Path,
-               target: dict, before: Path) -> str:
-    """点完之后「等列表停下来」再判断：ok / detail / down。
+def _judge_tap(adb: common.Adb, config: dict, frame,
+               target: dict, before) -> tuple[str, object]:
+    """点完之后「等列表停下来」再判断：ok / detail / down；返回 (verdict, frame)。
 
     - 先等静止：展开动画 + 列表回弹结束后坐标才可信；
     - 箭头变成 up → 展开成功；
@@ -255,40 +281,82 @@ def _judge_tap(adb: common.Adb, config: dict, shot: Path,
     - 画面完全没变且竖条仍是 down → 点击没生效（才允许补点一次）。
     """
     capture = config["capture"]
-    wait_still(adb, config, shot)
-    found = _find_same(detect_arrows(shot, config).get("strips", []), target)
+    _, frame = wait_still(adb, config)
+    found = _find_same(detect_arrows(frame, config).get("strips", []), target)
     if found is not None and found.get("label") == "up":
-        return "ok"
-    state = _state(shot, config)
+        return "ok", frame
+    state = _state(frame, config)
     if not state.get("reportPage") or not state.get("combatTabSelected"):
-        return "detail"
-    diff = common.visual_difference(before, shot)
+        return "detail", frame
+    diff = common.visual_difference(before, frame)
     changed = bool(diff["mean"] >= float(capture["visualDiffMean"])
                    or diff["changedRatio"] >= float(capture["changedRatio"]))
     # 竖条还在（可能还没翻面或已经滚出视野）：只要画面有明显变化就算点击生效，
     # 否则就是点击被吞了 —— 只有这种情况才允许补点一次。
-    return "ok" if changed else "down"
+    return ("ok" if changed else "down"), frame
 
 
-def _collapse_strip(adb: common.Adb, config: dict, shot: Path,
-                    target: dict, settle: float) -> int:
-    """把刚展开的卡再点一次收起来（展开内容已进 tcpdump，不必保持展开）。
+def wait_arrows(adb: common.Adb, config: dict, targets: list[dict],
+                label: str, timeout_ms: int = 1200,
+                interval_ms: int = 0) -> tuple[bool, object, list[dict]]:
+    """等「整屏静止」后再确认竖条箭头是否变为 `label`；返回 (ok, frame, matches)。
 
-    返回 1 表示收起成功。
+    为什么不用「单帧轮询」：展开/收起会带动列表惯性上顶，单帧拿到的坐标可能
+    还在动，按它点击会落到卡片本体（实测会误进战果详情页）。
+    这里先等整屏静止（raw 帧，2~4 帧），失败再补一次短等待；
+    代价可控，但点击坐标和安全边界都建立在「已停稳」的帧上。
     """
-    if not wait_still(adb, config, shot, timeout_ms=1200):
-        return 0
-    fresh = _find_same(detect_arrows(shot, config).get("strips", []), target)
-    if fresh is None or fresh.get("label") != "up":
-        return 0
-    adb.tap(int(fresh["clickX"]), int(fresh["clickY"]),
-            wait_ms=int(max(0.3, settle * 0.8) * 1000))
-    return 1
+    matches: list[dict] = []
+    frame = None
+    for _ in range(2):
+        _, frame = wait_still(adb, config, timeout_ms=timeout_ms)
+        strips = detect_arrows(frame, config).get("strips", [])
+        matches = []
+        for item in targets:
+            match = _find_same(strips, item)
+            if match is not None and match.get("label") == label:
+                matches.append(match)
+        if len(matches) >= len(targets):
+            return True, frame, matches
+    return False, frame, matches
 
 
-def expand_visible_cards(adb: common.Adb, config: dict, shot: Path,
-                         page: int, targets: dict) -> dict:
-    """自下而上逐个点开折叠卡，点开一张、确认一张。
+def _close_ups(adb: common.Adb, config: dict, frame, sources: list[dict],
+               gap_ms: int, close_wait_ms: int,
+               max_rounds: int = 2) -> tuple[int, int, object, bool]:
+    """把当前屏 up 卡片点回 down；返回 (确认收起数, 点击数, frame, 是否已稳定)。
+
+    每轮都用「当前帧检测到的 up 坐标」点击（列表可能已移动），最多两轮；
+    最后用一帧统一确认，避免「收起失败却当成成功」导致下次采集遗留展开态。
+    """
+    taps = 0
+    still = True
+    for _ in range(max(1, max_rounds)):
+        strips = detect_arrows(frame, config).get("strips", [])
+        # 直接收起「当前屏所有 up」：既处理本轮展开的卡，也处理历史遗留的展开卡；
+        # 不再依赖 sources 几何匹配（列表移动后会匹配失败，导致以为收起了其实没有）。
+        ups_to_tap = [item for item in strips if item.get("label") == "up"]
+        if not ups_to_tap:
+            break
+        for match in sorted(ups_to_tap, key=lambda obj: obj["clickY"], reverse=True):
+            adb.tap(int(match["clickX"]), int(match["clickY"]), wait_ms=gap_ms)
+            taps += 1
+        still, frame = wait_still(adb, config, timeout_ms=close_wait_ms)
+    strips = detect_arrows(frame, config).get("strips", [])
+    if not any(item.get("label") == "up" for item in strips):
+        # 本屏已无展开态：sources 里的卡都安全收回
+        return len(sources), taps, frame, still
+    closed = 0
+    for src in sources:
+        match = _find_same(strips, src)
+        if match is not None and match.get("label") == "down":
+            closed += 1
+    return closed, taps, frame, still
+
+
+def expand_visible_cards(adb: common.Adb, config: dict, frame,
+                         page: int, targets: dict) -> tuple[dict, object]:
+    """自下而上逐个点开折叠卡，点开一张、确认一张；返回 (result, frame)。
 
     关键约束（都是实测出来的坑）：
     1. **先把列表等静止，再取坐标**：滑动/展开后列表会自己往上顶 1.3~1.6s，
@@ -297,15 +365,29 @@ def expand_visible_cards(adb: common.Adb, config: dict, shot: Path,
        不点卡片、不点场次数字；
     3. 竖条底边低于 `bottomSafeRatio` 或被屏幕截断（`cutRatio`）时先上滑，绝不硬点；
     4. 只有「画面完全没变」才允许用静止后的新坐标补点一次，避免「展开→收起」抖动。
+
+    2026-11-23 优化：
+    - 帧全部在内存里（raw 截图），确认稳定后不再重复等静止；
+    - 批量连点后按「出现 up 箭头」确认展开数，没确认的目标不标记已处理，
+      下一轮会重试（避免把漏展开当成成功）；
+    - 本屏收尾用**新帧**审计，仍有完整可见、未处理过的 down 就先兜底展开再滑走。
     """
     expand = config["expand"]
     settle = int(expand.get("settleMs", 700)) / 1000.0
+    # 批量连点（可选）：自下而上连点 N 条箭头、点完统一确认。
+    # 实测多人同屏时下方卡会随展开位移，默认关闭；逐卡处理更稳。
+    burst_tap = bool(expand.get("burstTap", False))
+    burst_max = max(2, int(expand.get("burstMax", 4)))
+    burst_gap_ms = max(0, int(expand.get("burstGapMs", 80)))
+    # 稳定帧 + 箭头状态的双确认窗口（整屏惯性约 1.3s）
+    open_wait_ms = int(expand.get("openConfirmMs", 1600))
+    close_wait_ms = int(expand.get("closeConfirmMs", 1600))
     collapse_after_open = bool(expand.get("collapseAfterOpen", True))
     retry_tries = max(0, int(expand.get("retryTries", 1)))
     max_recoveries = max(1, int(expand.get("maxRecoveriesPerPage", 2)))
     final_settle = max(0, int(expand.get("finalSettleMs", 350))) / 1000.0
     max_taps = max(4, int(expand["maxPerPage"]) * 4)
-    screen_height = common.load_color(shot).shape[0]
+    screen_height = int(frame.shape[0])
     bottom_safe = int(screen_height * float(expand.get(
         "bottomSafeRatio", expand.get("safeBottomRatio", 0.90))))
     cut_limit = int(screen_height * float(expand.get("cutRatio", 0.94)))
@@ -316,22 +398,89 @@ def expand_visible_cards(adb: common.Adb, config: dict, shot: Path,
     skipped = 0
     taps = 0
     recoveries = 0
+    strip_seen = 0
+    down_seen = 0
+    leftover_down = 0
+    leftover_up = 0
+    pre_collapsed = 0
+    burst_batches = 0
     lost = False
     skip_targets: list[dict] = []
-    result: dict = {"targets": []}
-    before = shot.with_name(shot.stem + "_before_tap.png")
+    failed_attempts: dict[tuple, int] = {}
+    need_wait = False       # 仅在「刚点过/刚滑过」时才重新等静止
+
+    def pending(items):
+        return [item for item in items
+                if not any(_same_strip(item, skip) for skip in skip_targets)]
+
+    # 列表刚打开时可能还是骨架屏（画面静止但箭头尚未渲染）：多等一帧再判定空列表，
+    # 否则第一页会被当成「没有折叠卡」直接滑走，漏掉整屏战报。
+    if page == 1 and not detect_arrows(frame, config).get("strips"):
+        _, frame = wait_still(adb, config, timeout_ms=1500)
+
     while taps < max_taps:
-        # 1) 先等静止，再检测：坐标必须来自已经停稳的那一帧
-        if not wait_still(adb, config, shot):
-            adb.swipe(swipe_x, int(screen_height * 0.72),
-                      swipe_x, int(screen_height * 0.58), 400)
-            taps += 1
+        if need_wait:
+            still, frame = wait_still(adb, config)
+            if not still:
+                adb.swipe(swipe_x, int(screen_height * 0.72),
+                          swipe_x, int(screen_height * 0.58), 400)
+                taps += 1
+                need_wait = True
+                continue
+            need_wait = False
+        result = detect_arrows(frame, config)
+        strip_seen = max(strip_seen, len(result.get("strips", [])))
+        downs = pending(result.get("targets", []))
+        down_seen = max(down_seen, len(downs))
+        # 列表会保留「上一次采集遗留的展开态」。这类卡在本次 tcpdump 窗口里
+        # 不会重新下发详情，必须先收起、再当作普通折叠卡重新展开一次，
+        # 否则它的详细战报永远抓不到（这是「不展开会丢战报」的真实来源）。
+        # 注意：这里不排除 skip_targets —— 本轮已展开但收起失败的卡也要继续收，
+        # 否则会带着展开态滑走，污染下一次采集。
+        ups_open = [item for item in result.get("strips", [])
+                    if item.get("label") == "up"]
+        if ups_open:
+            closed, used, frame, stable = _close_ups(
+                adb, config, frame, ups_open, burst_gap_ms, close_wait_ms)
+            taps += used
+            pre_collapsed += closed
+            need_wait = not stable
             continue
-        result = detect_arrows(shot, config)
-        downs = [item for item in result.get("targets", [])
-                 if not any(_same_strip(item, skip) for skip in skip_targets)]
         if not downs:
             break
+        if burst_tap and len(downs) >= 2:
+            batch = sorted(downs, key=lambda item: item["clickY"],
+                           reverse=True)[:burst_max]
+            batch = [item for item in batch
+                     if (int(item["clickY"]) <= bottom_safe
+                         and int(item["y"]) + int(item["h"]) <= cut_limit)]
+            if len(batch) >= 2:
+                burst_batches += 1
+                for item in batch:
+                    adb.tap(int(item["clickX"]), int(item["clickY"]),
+                            wait_ms=burst_gap_ms)
+                    taps += 1
+                # 用「箭头翻面」确认，而不是等整屏静止：通常 1 帧就够
+                _, frame, ups = wait_arrows(adb, config, batch, "up",
+                                            open_wait_ms)
+                # 只把「真的翻成 up」的目标标记为已处理；没确认的留到下一轮重试
+                confirmed_sources = [item for item in batch
+                                     if _find_same(ups, item) is not None]
+                opened += len(confirmed_sources)
+                for item in confirmed_sources:
+                    skip_targets.append(item)
+                # 连点展开后要把它们收起来：不收缩会让列表越来越长，
+                # 同样的滑动距离能看到的卡更少，表现为「拖不动」。
+                if collapse_after_open and confirmed_sources:
+                    closed, used, frame, stable = _close_ups(
+                        adb, config, frame, confirmed_sources,
+                        burst_gap_ms, close_wait_ms)
+                    taps += used
+                    collapsed += closed
+                else:
+                    stable = False
+                need_wait = not stable
+                continue
         target = max(downs, key=lambda item: item["clickY"])
         if (int(target["clickY"]) > bottom_safe
                 or int(target["y"]) + int(target["h"]) > cut_limit):
@@ -341,74 +490,132 @@ def expand_visible_cards(adb: common.Adb, config: dict, shot: Path,
             adb.swipe(swipe_x, int(screen_height * 0.80),
                       swipe_x, int(screen_height * 0.54), 450)
             taps += 1
-            wait_still(adb, config, shot, timeout_ms=1800)
-            again = _find_same(detect_arrows(shot, config).get("strips", []), target)
+            _, frame = wait_still(adb, config, timeout_ms=1800)
+            again = _find_same(detect_arrows(frame, config).get("strips", []), target)
             if again is not None and (int(again["x"]), int(again["y"]),
                                       int(again["h"])) == mark:
                 skip_targets.append(target)
+            need_wait = False
             continue
-        before.write_bytes(shot.read_bytes())
         adb.tap(int(target["clickX"]), int(target["clickY"]),
                 wait_ms=int(settle * 1000))
         taps += 1
-        verdict = _judge_tap(adb, config, shot, target, before)
+        opened_ok, frame, matches = wait_arrows(adb, config, [target], "up",
+                                                open_wait_ms)
         attempt = 0
-        while verdict == "down" and attempt < retry_tries:
-            # 只有「画面一点没变」才会走到这里；补点也必须用静止后的新坐标
-            if not wait_still(adb, config, shot, timeout_ms=1800):
-                break
-            fresh = _find_same(detect_arrows(shot, config).get("strips", []), target)
-            if fresh is None or fresh.get("label") == "up":
-                verdict = "ok"
+        while not opened_ok and attempt < retry_tries:
+            # 先等动画停稳再判断，避免半途帧误判成「误入详情页」
+            _, frame = wait_still(adb, config, timeout_ms=900)
+            state = _state(frame, config)
+            if not state.get("reportPage") or not state.get("combatTabSelected"):
+                break       # 已经不在交战列表：多半误入详情页
+            fresh = _find_same(detect_arrows(frame, config).get("strips", []), target)
+            if fresh is None or fresh.get("label") != "down":
                 break
             if (int(fresh["clickY"]) > bottom_safe
                     or int(fresh["y"]) + int(fresh["h"]) > cut_limit):
                 break
-            before.write_bytes(shot.read_bytes())
             adb.tap(int(fresh["clickX"]), int(fresh["clickY"]),
                     wait_ms=int(settle * 1000))
             taps += 1
             attempt += 1
-            verdict = _judge_tap(adb, config, shot, fresh, before)
-        if verdict == "ok":
+            opened_ok, frame, matches = wait_arrows(adb, config, [target], "up",
+                                                    open_wait_ms)
+        if opened_ok:
             opened += 1
             # 展开一次就已经把该场战报数据下发给客户端（tcpdump 里已有帧），
-            # 所以立刻回点同一条竖条把它收起来：列表恢复紧凑，
-            # 同样的滑动距离能看到更多卡 —— 滚动更快、也更少漏展开。
+            # 所以立刻回点同一条竖条把它收起来；收起确认同样看箭头翻回 down。
             if collapse_after_open:
-                collapsed += _collapse_strip(adb, config, shot, target, settle)
-            # 收起后这条竖条会重新变成「展开箭头」；必须标记为已处理，
-            # 否则下一轮又会挑中它，反复展开→收起直到打满 max_taps
-            # （实测每页 expanded=collapsed=128，整页点击预算全耗在同一批卡上）。
+                closed, used, frame, stable = _close_ups(
+                    adb, config, frame, [target],
+                    int(max(0.2, settle * 0.8) * 1000), close_wait_ms)
+                taps += used
+                collapsed += closed
+            else:
+                stable = False
+            # 收起后这条竖条会重新变成 down；必须标记为已处理，
+            # 否则下一轮又会挑中它，反复展开→收起直到打满 max_taps。
             skip_targets.append(target)
+            need_wait = not stable
             continue
-        if verdict == "detail":
+        # 展开失败：等动画停稳后再判断是「点击被吞」还是「误入详情页」
+        _, frame = wait_still(adb, config, timeout_ms=900)
+        state = _state(frame, config)
+        if not state.get("reportPage") or not state.get("combatTabSelected"):
             failed += 1
-            if _recover_to_list(adb, config, shot, targets):
+            ok, frame = _recover_to_list(adb, config, frame, targets)
+            if ok:
                 recoveries += 1
-                wait_still(adb, config, shot, timeout_ms=1800)
+                _, frame = wait_still(adb, config, timeout_ms=1800)
                 skip_targets.append(target)
                 skipped += 1
+                need_wait = False
                 if recoveries >= max_recoveries:
                     break
                 continue
             lost = True
             break
         failed += 1
-        skip_targets.append(target)
-        skipped += 1
+        # 点击被吞：同一张卡本页最多再试一次（不立刻 skip，交给下一轮重试）；
+        # 两次仍失败才跳过，避免原地打转；下一屏还有机会重新展开。
+        finger = (int(target["x"]), int(target["y"]), int(target["h"]))
+        failed_attempts[finger] = failed_attempts.get(finger, 0) + 1
+        if failed_attempts[finger] >= 2:
+            skip_targets.append(target)
+            skipped += 1
+        need_wait = True
+
     if final_settle > 0:
         time.sleep(final_settle)
-    # 收尾再检测一次：还剩几条 down 就是「本屏没来得及展开」的，
-    # 正常情况下应为 0（滑动步长小于一张卡，没展开的下次会完整露出来）
-    final = detect_arrows(shot, config)
-    shot.with_name(f"screen_page_{page:02d}_expanded.png").write_bytes(shot.read_bytes())
-    return {"opened": opened, "collapsed": collapsed,
-            "failed": failed, "skipped": skipped, "taps": taps,
-            "recovered": recoveries > 0, "recoveries": recoveries, "lost": lost,
-            "stripCount": len(result.get("strips", [])),
-            "downsSeen": len(result.get("targets", [])),
-            "leftoverDowns": len(final.get("targets", []))}
+    if need_wait or lost:
+        _, frame = wait_still(adb, config, timeout_ms=1200)
+    # 本屏收尾审计（用新帧）：还有完整可见、本轮没处理过的 down → 兜底展开。
+    # 这是「不展开会丢战报」的保险：宁可慢 0.5s，也不带着没展开的卡滑走。
+    final = detect_arrows(frame, config)
+    rescue_left = [item for item in final.get("targets", [])
+                   if not any(_same_strip(item, skip) for skip in skip_targets)
+                   and int(item["clickY"]) <= bottom_safe
+                   and int(item["y"]) + int(item["h"]) <= cut_limit]
+    if rescue_left and not lost:
+        for item in sorted(rescue_left, key=lambda obj: obj["clickY"], reverse=True):
+            before = frame
+            adb.tap(int(item["clickX"]), int(item["clickY"]),
+                    wait_ms=int(settle * 1000))
+            taps += 1
+            verdict, frame = _judge_tap(adb, config, frame, item, before)
+            if verdict == "ok":
+                opened += 1
+                skip_targets.append(item)
+            elif verdict == "detail":
+                ok, frame = _recover_to_list(adb, config, frame, targets)
+                if ok:
+                    recoveries += 1
+                    skip_targets.append(item)
+                else:
+                    lost = True
+                    break
+            else:
+                skip_targets.append(item)
+        if collapse_after_open and not lost:
+            ups = [item for item in detect_arrows(frame, config).get("strips", [])
+                   if item.get("label") == "up"]
+            if ups:
+                closed, used, frame, _ = _close_ups(adb, config, frame, ups,
+                                                    burst_gap_ms, close_wait_ms)
+                taps += used
+                collapsed += closed
+        final = detect_arrows(frame, config)
+    leftover_down = len([item for item in final.get("targets", [])
+                         if not any(_same_strip(item, skip) for skip in skip_targets)])
+    leftover_up = len([item for item in final.get("strips", [])
+                       if item.get("label") == "up"])
+    strip_seen = max(strip_seen, len(final.get("strips", [])))
+    return ({"opened": opened, "collapsed": collapsed,
+             "failed": failed, "skipped": skipped, "taps": taps,
+             "recovered": recoveries > 0, "recoveries": recoveries, "lost": lost,
+             "stripCount": strip_seen, "downsSeen": down_seen,
+             "leftoverDowns": leftover_down, "leftoverUps": leftover_up,
+             "preCollapsed": pre_collapsed, "burstBatches": burst_batches}, frame)
 
 
 def list_moved(diff: dict, capture: dict) -> bool:
@@ -417,15 +624,16 @@ def list_moved(diff: dict, capture: dict) -> bool:
                 and diff["changedRatio"] >= float(capture["changedRatio"]))
 
 
-def estimate_shift(before: Path, after: Path) -> tuple[float | None, float]:
+def estimate_shift(before, after) -> tuple[float | None, float]:
     """量一次滑动实际滚了多少像素（负值 = 内容上移）。
 
     用模板匹配而不是相位相关：列表里全是“长得差不多”的卡片，相位相关会给
     出 ±150 这种自相矛盾的结果。这里取三条横向切片分别匹配，取分数最高的那条。
+    只在「没移动/疑似到底」时调用；正常页跳过可省 0.2s。
     """
     cv2 = common.load_engine("cv2")
-    gray_a = cv2.cvtColor(common.load_color(before), cv2.COLOR_BGR2GRAY)
-    gray_b = cv2.cvtColor(common.load_color(after), cv2.COLOR_BGR2GRAY)
+    gray_a = cv2.cvtColor(common.to_color(before), cv2.COLOR_BGR2GRAY)
+    gray_b = cv2.cvtColor(common.to_color(after), cv2.COLOR_BGR2GRAY)
     if gray_a.shape != gray_b.shape:
         return None, 0.0
     height, width = gray_a.shape[:2]
@@ -448,26 +656,27 @@ def estimate_shift(before: Path, after: Path) -> tuple[float | None, float]:
 
 
 def swipe_page(adb: common.Adb, config: dict, targets: dict,
-               before: Path, after: Path, page: int) -> dict:
-    """向上滑一屏并判断列表是否真的移动。
+               before, after_path: Path, page: int) -> tuple[dict, object]:
+    """向上滑一屏并判断列表是否真的移动；返回 (result, after_frame)。
 
     没有移动时先等一小段再复检一次：列表可能正在向服务器请求下一批战报，
     立刻判“到底”会把只加载了一半的列表当成结束。
+
+    2026-11-23 优化：帧走内存 raw；只有「没移动」时才做模板位移估计
+    （正常页省 ~0.2s），证据帧用 save_color 落盘。
     """
     capture = config["capture"]
     x1, y1, x2, y2, duration = targets["swipe"]
-    height = int(common.load_color(before).shape[0])
+    height = int(before.shape[0])
     retry_y1 = int(height * float(capture.get("swipeRetryY1", 0.82)))
     retry_y2 = int(height * float(capture.get("swipeRetryY2", 0.20)))
     retry_ms = int(capture.get("swipeRetryDurationMs", 900))
-    # 新帧先写临时文件，最后再拷成 screen_page_XX_after_swipe.png（干净可回溯）
-    work = after.with_name(after.stem + "_work.png")
     adb.swipe(x1, y1, x2, y2, duration)
     time.sleep(int(capture["swipeDelayMs"]) / 1000.0)
     # 滑完先等列表真正静止（惯性 + 图片懒加载约 1.3~1.6s），再做“有没有移动”的判断，
     # 否则会拿半途的帧去算差异，既可能误判到底，也会让下一步点击坐标失效
-    wait_still(adb, config, work)
-    diff = common.visual_difference(before, work)
+    _, frame = wait_still(adb, config)
+    diff = common.visual_difference(before, frame)
     moved = list_moved(diff, capture)
     attempts = 1
     if not moved:
@@ -475,30 +684,28 @@ def swipe_page(adb: common.Adb, config: dict, targets: dict,
         # 换一个更低、更慢的第二次滑动，绝不能一次没动就判列表到底。
         adb.swipe(x1, retry_y1, x2, retry_y2, retry_ms)
         time.sleep(int(capture["swipeDelayMs"]) / 1000.0)
-        wait_still(adb, config, work)
-        diff = common.visual_difference(before, work)
+        _, frame = wait_still(adb, config)
+        diff = common.visual_difference(before, frame)
         moved = list_moved(diff, capture)
         attempts += 1
     if not moved:
         # 还没动：可能是列表正在向服务器请求下一批战报，等一会儿再复检
         time.sleep(int(capture.get("stalledProbeDelayMs") or 1500) / 1000.0)
-        wait_still(adb, config, work)
-        diff = common.visual_difference(before, work)
+        _, frame = wait_still(adb, config)
+        diff = common.visual_difference(before, frame)
         moved = list_moved(diff, capture)
         attempts += 1
-    after.write_bytes(work.read_bytes())
-    try:
-        work.unlink()
-    except OSError:
-        pass
-    shift, shift_score = estimate_shift(before, after)
-    state = _state(after, config)
-    return {"moved": bool(moved), "difference": diff, "attempts": attempts,
-            "shiftPx": round(shift, 1) if shift is not None else None,
-            "shiftScore": round(shift_score, 3),
-            "combatTabSelected": bool(state.get("combatTabSelected")),
-            "blockingOverlay": bool(state.get("blockingOverlay")),
-            "page": page}
+    common.save_color(frame, after_path)
+    shift, shift_score = (None, 0.0)
+    if not moved:
+        shift, shift_score = estimate_shift(before, frame)
+    state = _state(frame, config)
+    return ({"moved": bool(moved), "difference": diff, "attempts": attempts,
+             "shiftPx": round(shift, 1) if shift is not None else None,
+             "shiftScore": round(shift_score, 3),
+             "combatTabSelected": bool(state.get("combatTabSelected")),
+             "blockingOverlay": bool(state.get("blockingOverlay")),
+             "page": page}, frame)
 
 
 # --------------------------------------------------------------------------- #
@@ -507,7 +714,8 @@ def swipe_page(adb: common.Adb, config: dict, targets: dict,
 def run_capture(config: dict, *, kind: str = "production", label: str = "",
                 report_era: str = "", max_pages: int | None = None,
                 max_seconds: int = 1800, expand: bool = True,
-                output_root: str | Path | None = None) -> dict:
+                output_root: str | Path | None = None,
+                require_list_end: bool | None = None) -> dict:
     adb = common.make_adb(config)
     adb.ensure_online()
     if not adb.ensure_root():
@@ -529,23 +737,23 @@ def run_capture(config: dict, *, kind: str = "production", label: str = "",
     stamp = time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time() * 1000) % 1000:03d}"
     capture_id = f"mumu_adb_{kind}_{stamp}"
     capture_dir = common.ensure_dir(root / capture_id)
-    # 工作截图单独用一个文件，screen_main/screen_page_* 只存「干净的那一帧」，
-    # 这样事后翻截图能直接看出每一屏到底展开了什么，不会被后续覆盖污染
-    shot = capture_dir / "work_current.png"
+    # screen_main/screen_page_* 只存「干净的那一帧」，事后翻截图能看出每屏展开状态
     main_shot = capture_dir / "screen_main.png"
     started = time.time()
+    _reset_frame_stats()
 
-    width, height = adb.screenshot(shot)
-    main_shot.write_bytes(shot.read_bytes())
-    state = _state(shot, config)
+    frame = grab(adb)
+    height, width = frame.shape[:2]
+    common.save_color(frame, main_shot)
+    state = _state(frame, config)
     if state.get("blockingOverlay"):
         raise RuntimeError("主界面检测到遮挡/弹窗：见 capture_dir/screen_main.png，先人工清理")
     targets = common.targets_for(config, width, height)
     # 已经停在战报页时先返回再重进：否则列表不会重新请求，pcap 里没有战报帧
     if state.get("reportPage") and config["capture"].get("forceReload", True):
         adb.tap(*targets["pageBack"], wait_ms=900)
-        adb.screenshot(shot)
-        state = _state(shot, config)
+        frame = grab(adb)
+        state = _state(frame, config)
         if state.get("reportPage"):
             raise RuntimeError("无法返回上一页（仍在战报页）：见 capture_dir/screen_main.png")
 
@@ -574,17 +782,18 @@ def run_capture(config: dict, *, kind: str = "production", label: str = "",
     collapsed = 0
     failed = 0
     recoveries = 0
+    expand_seconds = 0.0
+    swipe_seconds = 0.0
     stop_reason = "not_started"
     page_log: list[dict] = []
     try:
-        width, height = adb.screenshot(shot)
         capture_meta["screen"] = {"width": width, "height": height}
         targets = common.targets_for(config, width, height)
-        nav = open_combat_list(adb, config, targets, shot)
+        nav, frame = open_combat_list(adb, config, targets, capture_dir)
         list_shot = capture_dir / "screen_list.png"
-        list_shot.write_bytes(shot.read_bytes())
+        common.save_color(frame, list_shot)
         nav["path"] = str(list_shot)
-        nav["state"] = _state(list_shot, config)
+        nav["state"] = _state(frame, config)
         # maxPages=0（默认）表示不设页数上限，必须一直滑到列表真正到底；
         # hardMaxPages 只是防止界面异常导致死循环的安全上限。
         limit = int(max_pages or config["capture"].get("maxPages") or 0)
@@ -597,10 +806,15 @@ def run_capture(config: dict, *, kind: str = "production", label: str = "",
             if time.time() - started >= max_seconds:
                 stop_reason = "max_runtime"
                 break
+            page_started = time.time()
             screens = page
             entry: dict = {"page": page}
             if expand:
-                result = expand_visible_cards(adb, config, shot, page, targets)
+                expand_started = time.perf_counter()
+                result, frame = expand_visible_cards(adb, config, frame, page, targets)
+                expand_seconds += time.perf_counter() - expand_started
+                common.save_color(
+                    frame, capture_dir / f"screen_page_{page:02d}_expanded.png")
                 opened += result["opened"]
                 collapsed += result.get("collapsed", 0)
                 failed += result["failed"]
@@ -611,18 +825,25 @@ def run_capture(config: dict, *, kind: str = "production", label: str = "",
                               "taps": result["taps"],
                               "strips": result.get("stripCount"),
                               "downsSeen": result.get("downsSeen"),
-                              "leftoverDowns": result.get("leftoverDowns")})
+                              "leftoverDowns": result.get("leftoverDowns"),
+                              "leftoverUps": result.get("leftoverUps"),
+                              "preCollapsed": result.get("preCollapsed"),
+                              "burstBatches": result.get("burstBatches")})
                 if result.get("recovered"):
                     recoveries += 1
                 if result.get("lost"):
                     stop_reason = "detail_lost"
+                    entry["seconds"] = round(time.time() - page_started, 1)
                     page_log.append(entry)
                     break
             after = capture_dir / f"screen_page_{page:02d}_after_swipe.png"
-            move = swipe_page(adb, config, targets, shot, after, page)
+            swipe_started = time.perf_counter()
+            move, frame = swipe_page(adb, config, targets, frame, after, page)
+            swipe_seconds += time.perf_counter() - swipe_started
             entry.update({"moved": move["moved"],
                           "swipeAttempts": move.get("attempts", 1),
                           "shiftPx": move.get("shiftPx")})
+            entry["seconds"] = round(time.time() - page_started, 1)
             page_log.append(entry)
             if move["blockingOverlay"]:
                 stop_reason = "blocking_overlay"
@@ -630,8 +851,8 @@ def run_capture(config: dict, *, kind: str = "production", label: str = "",
             if not move["combatTabSelected"]:
                 # 多半是误入了战果/详情页：返回列表后再继续
                 adb.tap(*targets["pageBack"], wait_ms=900)
-                adb.screenshot(shot)
-                if _state(shot, config).get("combatTabSelected"):
+                frame = grab(adb)
+                if _state(frame, config).get("combatTabSelected"):
                     recoveries += 1
                     stalled += 1
                     continue
@@ -645,8 +866,6 @@ def run_capture(config: dict, *, kind: str = "production", label: str = "",
             else:
                 stalled = 0
                 pages += 1
-            # 下一屏继续用工作截图文件，页面快照保持干净、不被覆盖
-            shot.write_bytes(after.read_bytes())
         if stop_reason == "not_started":
             stop_reason = "page_limit" if max_pages else "hard_page_cap"
     finally:
@@ -685,8 +904,18 @@ def run_capture(config: dict, *, kind: str = "production", label: str = "",
         "stopReason": stop_reason,
         "seconds": elapsed,
         "navigation": nav,
-        # 逐屏明细：leftoverDowns>0 说明这一屏还有折叠卡没展开（正常应为 0）
+        # 逐屏明细：leftoverDowns>0 说明这一屏还有「未处理且完整可见」的折叠卡
+        # （收尾已用新帧审计并兜底展开，正常应为 0）
         "pageLog": page_log,
+        # 性能明细：截图帧数/耗时、展开与滑动分段耗时、逐页均值
+        "visualTiming": {
+            **frame_stats(),
+            "expandSeconds": round(expand_seconds, 1),
+            "swipeSeconds": round(swipe_seconds, 1),
+            "pageAvgSeconds": (round(sum(float(item.get("seconds", 0.0))
+                                         for item in page_log) / len(page_log), 1)
+                               if page_log else 0.0),
+        },
     }
     # pageLog 只留在本地 capture_result.json：capture_metadata.json 有 schemaVersion 契约，
     # 不往里塞额外字段，避免上传端校验变严时被拒
@@ -698,8 +927,9 @@ def run_capture(config: dict, *, kind: str = "production", label: str = "",
         json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     if result["pcapBytes"] <= 24:
         raise RuntimeError(f"pcap 为空或无效：{pcap}")
-    if (not complete and kind == "production"
-            and bool(config["capture"].get("requireListEnd", True))):
+    if require_list_end is None:
+        require_list_end = bool(config["capture"].get("requireListEnd", True))
+    if not complete and kind == "production" and require_list_end:
         (capture_dir / "incomplete.json").write_text(
             json.dumps({"stopReason": stop_reason, "pages": pages, "screens": screens,
                         "complete": False}, ensure_ascii=False, indent=2) + "\n",

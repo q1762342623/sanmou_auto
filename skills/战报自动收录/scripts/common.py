@@ -109,7 +109,14 @@ DEFAULT_CONFIG: dict = {
         "maxHeight": 240,        # 实测 193~218；放开到 0.55*ROI 会把卡片整框吃进来
         "clickBottomInset": 26,  # 点击点距竖条底边（箭头双 V 的中心约在 h-28）
         "maxPerPage": 6,
-        "settleMs": 700,         # 点击后等展开动画；实测箭头 <200ms 翻面，但要连同列表一起停稳
+        # 批量连点会让下方卡片随展开整体位移，确认/收起都容易错位；默认逐卡处理，
+        # 稳定帧 + 箭头状态双确认，实测整体更快也更稳。
+        "burstTap": False,
+        "burstMax": 4,
+        "burstGapMs": 80,
+        "openConfirmMs": 1600,   # 等整屏静止且箭头翻成 up 的窗口
+        "closeConfirmMs": 1600,  # 等整屏静止且箭头翻回 down 的窗口
+        "settleMs": 220,         # 点击后短等；真正的成功判定看箭头翻面，不等整屏静止
         "retryTries": 1,         # 只有「画面完全没变」才补点一次，且必须用静止后的新坐标
         "maxRecoveriesPerPage": 2,  # 本页最多容忍 2 次误入详情并回退，避免死循环
         # 竖条底边 864px（0.96 屏高）实测点击有效；只有更靠底（>0.955）才先上滑
@@ -145,6 +152,8 @@ DEFAULT_CONFIG: dict = {
         "forceReload": True,
     },
     "report": {"reportEra": "auto", "label": "sanmou-auto-war-report"},
+    # 每轮采集/上报后汇总交战坐标，输出最高频点（见 scripts/coordinate_stats.py）
+    "coordinates": {"enabled": True, "topN": 10, "minBlobSize": 1000},
     "server": {
         "configPath": "control/server_upload.json",
         "baseUrl": "",
@@ -342,6 +351,51 @@ class Adb:
         with Image.open(path) as image:
             return image.size
 
+    def _grab_png(self):
+        """兜底：设备 raw 格式不认识时退回 PNG（设备端编码约慢 0.4s）。"""
+        cv2 = load_engine("cv2")
+        import numpy as np
+
+        data = self.run(["exec-out", "screencap", "-p"], binary=True, timeout=90)
+        if not data:
+            raise AdbError("screencap 返回空数据")
+        image = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if image is None:
+            raise AdbError("screencap PNG 解码失败")
+        return image
+
+    def grab(self):
+        """抓一帧并在内存里解成 BGR ndarray（默认走 raw，约 0.24s/帧）。
+
+        `screencap -p` 要在设备端做 PNG 编码，实测 0.62~0.68s/帧；
+        不带 `-p` 的 raw RGBA 只需 0.22~0.24s，本地 numpy 解码 <1ms。
+        帧头：width(4) height(4) format(4) [colorspace(4)]，全部小端。
+        返回 BGR 顺序（与 cv2 约定一致），供模板/OCR 直接复用。
+        """
+        import numpy as np
+
+        data = self.run(["exec-out", "screencap"], binary=True, timeout=90)
+        if not data or len(data) < 16:
+            return self._grab_png()
+        raw = np.frombuffer(data, dtype=np.uint8)
+        width = int.from_bytes(raw[0:4].tobytes(), "little")
+        height = int.from_bytes(raw[4:8].tobytes(), "little")
+        fmt = int.from_bytes(raw[8:12].tobytes(), "little")
+        header = len(raw) - width * height * 4
+        if width <= 0 or height <= 0 or header not in (12, 16):
+            return self._grab_png()
+        pixels = raw[header:header + width * height * 4].reshape((height, width, 4))
+        # format=1 是 RGBA_8888：BGR 取 [2,1,0]；其它按 RGBX 处理
+        bgr = pixels[:, :, 2::-1] if fmt == 1 else pixels[:, :, :3]
+        return np.ascontiguousarray(bgr)
+
+    def screenshot_fast(self, path: str | Path | None = None):
+        """抓一帧（内存 BGR），需要留证时再写 PNG；返回 ndarray。"""
+        image = self.grab()
+        if path is not None:
+            save_color(image, path)
+        return image
+
     def push(self, local: str | Path, remote: str) -> None:
         self.run(["push", str(local), remote])
 
@@ -377,12 +431,31 @@ def load_color(path: str | Path):
     return image
 
 
-def inspect_screenshot(path: str | Path, compare: str | Path | None = None) -> dict:
+def to_color(image):
+    """接受「路径」或「已解码 BGR ndarray」，统一返回 ndarray（避免重复解码）。"""
+    if isinstance(image, (str, Path)):
+        return load_color(image)
+    return image
+
+
+def save_color(image, path: str | Path) -> None:
+    """把内存帧写成 PNG 留证（中文路径用 imencode + write_bytes 最稳）。"""
+    cv2 = load_engine("cv2")
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ok, buffer = cv2.imencode(".png", image)
+    if not ok:
+        raise RuntimeError(f"截图编码失败：{path}")
+    path.write_bytes(buffer.tobytes())
+
+
+def inspect_screenshot(image, compare=None) -> dict:
     ui = load_engine("inspect_mumu_ui")
     template = TEMPLATES_DIR / "portrait_report_entry.png"
     return ui.inspect(
-        load_color(path),
-        load_color(compare) if compare else None,
+        to_color(image),
+        to_color(compare) if compare else None,
         ui.load_gray(template) if template.is_file() else None,
     )
 
@@ -408,13 +481,14 @@ def _ocr_text(image_bgr) -> str:
     return _ocr_engine().ocr_text(Image.fromarray(image_bgr[:, :, ::-1]), scale=2.0)
 
 
-def tab_status(path: str | Path, config: dict) -> dict:
+def tab_status(image, config: dict) -> dict:
     """战报页判定：页签行 OCR 文字 + 每个页签的金色边框比例。
 
     上游 inspect_mumu_ui 的横屏页签阈值在城内视角会误报（建筑/顶栏也是金色），
     这里加一道「OCR 必须出现 交战/收藏/开拓」的硬门槛。
+    `image` 可以是路径，也可以是已解码帧（采集热路径复用同一帧，省一次解码）。
     """
-    image = load_color(path)
+    image = to_color(image)
     height, width = image.shape[:2]
     x1, y1, x2, y2 = config["targets"]["tabBand"]
     left, right = max(0, int(x1 * width)), min(width, int(x2 * width))
@@ -445,10 +519,14 @@ def tab_status(path: str | Path, config: dict) -> dict:
     }
 
 
-def page_state(path: str | Path, config: dict) -> dict:
-    """页签状态 + 遮挡检测，采集流程与 CLI 共用。"""
-    state = tab_status(path, config)
-    engine = inspect_screenshot(path)
+def page_state(image, config: dict) -> dict:
+    """页签状态 + 遮挡检测，采集流程与 CLI 共用。
+
+    同一帧只解码一次：tab_status / inspect_screenshot 共用传入的 ndarray。
+    """
+    image = to_color(image)
+    state = tab_status(image, config)
+    engine = inspect_screenshot(image)
     state["blockingOverlay"] = bool(engine.get("blockingOverlay"))
     state["dialogOverlay"] = bool(engine.get("dialogOverlay"))
     state["orientation"] = engine.get("orientation")
@@ -495,9 +573,9 @@ def targets_for(config: dict, width: int, height: int) -> dict:
     }
 
 
-def visual_difference(before: str | Path, after: str | Path) -> dict:
+def visual_difference(before, after) -> dict:
     ui = load_engine("inspect_mumu_ui")
-    return ui.visual_difference(load_color(before), load_color(after))
+    return ui.visual_difference(to_color(before), to_color(after))
 
 
 # --------------------------------------------------------------------------- #
@@ -554,8 +632,9 @@ __all__ = [
     "SKILL_ROOT", "PROJECT_ROOT", "SCRIPTS_DIR", "ENGINE_DIR", "TEMPLATES_DIR",
     "WORK_DIR", "CAPTURE_ROOT", "CONTROL_DIR", "DEFAULT_CONFIG", "Adb", "AdbError",
     "load_config", "resolve_path", "load_engine", "json_print", "make_adb",
-    "load_color", "inspect_screenshot", "targets_for", "visual_difference",
-    "tab_status", "page_state", "TAB_WINDOWS", "TAB_SELECTED_GOLD",
+    "load_color", "to_color", "save_color", "inspect_screenshot", "targets_for",
+    "visual_difference", "tab_status", "page_state", "TAB_WINDOWS",
+    "TAB_SELECTED_GOLD",
     "pixels", "wait_until", "timestamp", "which_python", "has_module",
     "find_tcpdump", "ensure_dir", "copy_tree_hint", "shutil",
 ]
