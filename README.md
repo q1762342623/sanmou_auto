@@ -24,6 +24,9 @@
 - [`skills/三谋拉线与战报自动收集/`](../skills/三谋拉线与战报自动收集/)：
   `SKILL.md` + 7 条原子指令（[`commands/`](commands/__init__.py)）+ 调度器
   （[`atomic_loop.py`](atomic_loop.py)）+ 只读汇报（[`../tools/hotspot_status.py`](../tools/hotspot_status.py)）。
+- [`skills/同盟管理-排行榜导出/`](skills/同盟管理-排行榜导出/SKILL.md)：
+  点「排行」逐榜单抓包 → 人数硬校验 → 单文件静态 HTML
+  （入口 `python skills/同盟管理-排行榜导出/scripts/collect.py`）。
 
 ## 当前状态
 
@@ -31,6 +34,7 @@
 | --- | --- | --- |
 | **三谋拉线与战报自动收集（原子指令 + 热点驱动）**：据点收集 → 主城坐标 → 战报收集（热点）→ 据点调动 → 补给兵力 → 部队进攻 → 部队撤回，任意两条业务指令之间必插一次完整战报收集 | ✅ 实机验证（2026-11-24/25） | `python -m sanmou_auto.atomic_loop --hours 13` |
 | **战报自动收录**：进「战报→同盟→交战」逐卡展开 + 滑到底，设备内 tcpdump → BLOB → 增量上传，并算最高频次交战坐标 | ✅ 实测通过（2026-11-21） | `python skills/战报自动收录/scripts/round.py` |
+| **同盟管理-排行榜导出**：点「排行」逐榜单抓包（繁荣/武勋/首占 9 级/阵营内排行），人数硬校验（300 / 300 / 100 / 每阵营 ≥100）不达标自动重抓，出单文件静态 HTML（按同盟汇聚 + 首占榜分类与第 100 名时间 + 阵营两表按名次区间分配问鼎·霸业） | ✅ 实测通过（2026-11-26，300/300/100/549+550） | `python skills/同盟管理-排行榜导出/scripts/collect.py` |
 | **13h 长跑守护**：定时汇报 / 掉线重连 / 异常与卡死重启 | ✅ 实测（`hotspot_supervisor`） | `python tools/hotspot_supervisor.py --spawn --hours 13` |
 
 ### 环境依赖
