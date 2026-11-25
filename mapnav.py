@@ -15,15 +15,15 @@ from dataclasses import dataclass
 import numpy as np
 from PIL import Image
 
-from . import config, ocrengine, vision
+from . import config, fastwait, ocrengine, vision
 from .adb import Adb
 
 COORD_RE = re.compile(r"[(（]\s*(\d{2,4})\s*[,，.、]\s*(\d{2,4})\s*[)）]")
 NOISE = ("升级中", "建造中", "拆除中")
 
 # 误入的二级页标题关键字（出现这些说明不在世界地图、也不在城内视角）
-WRONG_PAGE_HINTS = ("武将库", "亲卫部队", "部队总览", "战报", "同盟",
-                    "城池", "设施", "编队", "邮件")
+WRONG_PAGE_HINTS = ("武将库", "亲卫部队", "部队总览", "配将助手", "战报",
+                    "同盟", "城池", "设施", "编队", "邮件")
 # 地块/据点详情浮层的右侧动作列（出现 ≥2 个就说明浮层盖住了底栏，邮件点不开）
 DETAIL_PANEL_HINTS = ("行军", "调动", "驻守", "生产辎重", "整编", "奔袭")
 
@@ -60,7 +60,7 @@ EXIT_CANCEL_ID = "tv_gs_exit_cancel"
 MOBILIZE_PANEL_HINT_BOX = config._p((300, 560, 1300, 620), (0, 1230, 900, 1600))
 # 只用面板独有特征：地图底栏本身也有「编队 / 锁定视角」，不能用它们判面板。
 MOBILIZE_PANEL_HINTS = ("请选择出征部队", "调动速度")
-MOBILIZE_PANEL_HINTS_PAIR = ("不消耗", "耗时")   # 「体力 200(不消耗) + 耗时 hh:mm:ss」组合
+MOBILIZE_PANEL_HINTS_PAIR = ("耗时",)   # 体力行可能是「不消耗」或「(-40)」
 # 竖屏实测：地图中央偏右的 ✕ @(528,585) 才是面板关闭键；
 # (860,1240)/(115,1548)/(60,1440)/(160,1440) 全部无效。
 MOBILIZE_CLOSE = config._p((1560, 95), (528, 585))
@@ -108,7 +108,11 @@ class MapNav:
         has_left = ("武将" in flat) or ("同盟" in flat)
         has_right = ("征战" in flat) or ("证战" in flat)
         if has_left and has_right:
-            # 底栏可见还不够：地块详情浮层会盖住左半底栏（邮件点不开），
+            # 底栏可见还不够（城内视角底栏也是「武将/同盟/职业/证战」）：
+            # 先看左下按钮是「出城」(城内) 还是「回城」(地图)，再排除地块浮层。
+            if self.in_city_view(img):
+                return False
+            # 地块详情浮层会盖住左半底栏（邮件点不开），
             # 必须确认右侧没有「行军/调动/驻守…」动作列。
             return not self.detail_panel_visible(img)
         if not has_left:
@@ -147,7 +151,8 @@ class MapNav:
                        ).replace(" ", "")
         if any(h in text for h in MOBILIZE_PANEL_HINTS):
             return True
-        return all(h in text for h in MOBILIZE_PANEL_HINTS_PAIR)
+        return ("耗时" in text
+                and ("体力" in text or "不消耗" in text))
 
     def close_mobilize_panel(self, wait: float = 1.3, tries: int = 2) -> bool:
         """点面板右上角收起 ✕ 关掉「调动/出征」面板。"""
@@ -185,13 +190,11 @@ class MapNav:
         3) 右下「亲卫营」标签可见。
         """
         img = img or self.adb.screencap()
-        text = ocrengine.ocr_text(vision.crop(img, CITY_VIEW_BOX), 2.0).replace(" ", "")
-        if any(h in text for h in CITY_VIEW_HINTS):
-            return True
-        # 左下按钮文字兜底：城内是「出城」，地图是「回城」
+        # 左下按钮先判（小区域 OCR，便宜且最确定）：城内是「出城」，地图是「回城」。
         if "出城" in self.home_button_text(img):
             return True
-        return False
+        text = ocrengine.ocr_text(vision.crop(img, CITY_VIEW_BOX), 2.0).replace(" ", "")
+        return any(h in text for h in CITY_VIEW_HINTS)
 
     def leave_city(self, tries: int = 2, wait: float = 2.5) -> bool:
         """城内点左下「出城」回世界地图：先按 OCR 找到的「出城」文字点，再退回固定候选点。"""
@@ -204,7 +207,9 @@ class MapNav:
             points += [p for p in CITY_EXIT_POINTS if p not in points]
             for point in points:
                 self.adb.tap(*point)
-                time.sleep(wait)
+                # 先等画面静止（出城动画 ~0.8s），再判一次地图；不等满固定 2.5s
+                fastwait.wait_settle(self.adb, box=config.MAP_BOTTOM_SLOT,
+                                     timeout=max(1.6, wait), min_wait=0.5)
                 if self.on_map():
                     self.log("  ✓ 已出城回到世界地图")
                     return True
@@ -328,16 +333,34 @@ class MapNav:
         return ok
 
     def ensure_map(self, tries: int = 5, wait: float = 1.2) -> bool:
-        """关掉所有叠层面板回到地图（左上返回箭头；在城里则先「出城」）。"""
+        """关掉所有叠层面板回到地图（左上返回箭头；在城里则先「出城」）。
+
+        注意：BACK 键在战报/详情页会弹「确认退出游戏」，连环按会一直弹框。
+        这里每次调用最多按 1 次 BACK，剩下交给调用方下一轮再试。
+        """
+        backs = 0
         for i in range(tries):
             img = self.adb.screencap()
+            # 沙盘页（缩到最小后）底栏是「城池/战没/同盟/个人」，
+            # 点同盟入口只会打开排行榜，后续全部失败 —— 先放大退出沙盘。
+            try:
+                from .sandbox import SandboxJump
+                sb = SandboxJump(self.adb, log=self.log)
+                if sb.visible(img):
+                    sb.close()
+                    time.sleep(wait)
+                    continue
+            except Exception:               # noqa: BLE001 - 沙盘判定失败不影响主流程
+                pass
+            # 先判「是否已经在地图」：命中就直接返回，省掉一次面板 OCR
+            # （ensure_map 每轮被调用很多次，旧顺序每次都要多扫一大块区域）。
+            if self.on_map(img):
+                return True
             # 调动/出征面板残留时，地图上半仍可见、底栏却被盖住，
             # 必须先收起面板，否则后续点邮件图标全部无效。
             if self.mobilize_panel_visible(img):
                 self.close_mobilize_panel()
                 continue
-            if self.on_map(img):
-                return True
             if self.exit_dialog_visible():
                 self.cancel_exit_dialog()
                 continue
@@ -345,6 +368,16 @@ class MapNav:
             # 必须优先点「确定」把它关掉，否则后面全是无效点击。
             if self.jump_dialog_visible(img):
                 self.confirm_jump(1.6, tries=2)
+                continue
+            # 「部队总览」「配将助手 → 查看阵容」这类弹窗：左上返回无效，点右上 ✕。
+            # 标题在屏幕中部（不是 page_title 的 0~115 区域），单独 OCR 一次。
+            dialog_title = ocrengine.ocr_text(
+                vision.crop(img, config.PANEL_DIALOG_TITLE_BOX), 2.0
+            ).replace(" ", "")
+            if "部队总览" in dialog_title or "查看阵容" in dialog_title:
+                self.log(f"  ! 停在弹窗「{dialog_title[:12]}」→ 点右上 ✕")
+                self.adb.tap(*config.PANEL_DIALOG_CLOSE)
+                time.sleep(1.0)
                 continue
             if self.dismiss_modal(img):
                 continue
@@ -367,9 +400,13 @@ class MapNav:
             # 只有真的看到「返回」按钮才点 MAIL_BACK；
             # 盲点会在地图上命中「武将」按钮，把界面推进「武将库」（历史事故）。
             if self.back_button_visible(img):
-                self.adb.tap(*config.MAIL_BACK)
-                time.sleep(wait)
+                fastwait.tap_settle(self.adb, config.MAIL_BACK, timeout=1.4,
+                                    min_wait=0.3)
                 continue
+            if backs >= 1:
+                self.log("  · 页面状态不明确，本轮不再按 BACK（避免退出弹窗连环）")
+                break
+            backs += 1
             self.press_back(wait)
         return self.on_map()
 
@@ -391,14 +428,21 @@ class MapNav:
         return fallback
 
     def confirm_jump(self, wait: float = 2.5, tries: int = 2) -> bool:
-        """点「确定」完成跳转；点歪/弹框残留就重试（弹框会吃掉所有后续点击）。"""
+        """点「确定」完成跳转；点歪/弹框残留就重试（弹框会吃掉所有后续点击）。
+
+        「点完固定 sleep 2.5s」改成「轮询弹框是否消失」：实测弹框 0.5~1.2s
+        就关掉、地图相机随后落位，省下的 1~1.5s 在每轮 3~5 次跳转里很可观。
+        """
         last = config.CONFIRM_JUMP
         for i in range(max(1, tries)):
             img = self.adb.screencap()
             last = self._jump_button_point(img, "确定")
             self.adb.tap(*last)
-            time.sleep(wait)
-            if not self.jump_dialog_visible():
+            gone = fastwait.wait_until(
+                self.adb,
+                lambda frame: not self.jump_dialog_visible(frame),
+                timeout=max(1.2, wait), interval=0.25, min_wait=0.45)
+            if gone:
                 return True
             self.log(f"  ! 跳转弹框仍在（点 {last}），重试 {i + 1}/{tries}")
         return not self.jump_dialog_visible()

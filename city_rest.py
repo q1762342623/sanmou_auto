@@ -215,11 +215,19 @@ def _now_seconds(clock_text: str) -> int:
 
 
 def _arrive_epoch(arrive_at: str, clock_text: str) -> float:
+    """把「00:41:21 到达」换算成本地 epoch。
+
+    注意：逐队登记时先派出的部队「到达时间」可能已经过去，
+    直接 `% 86400` 会算成「明天同一时刻」（+24h），召回逻辑就会一直以为
+    「还在路上」而跳过检查。超过 12h 的差值按「刚刚过去」处理。
+    """
     arrive = _to_seconds(arrive_at)
     if arrive is None:
         return 0.0
     now = _now_seconds(clock_text)
     delta = (arrive - now) % 86400
+    if delta > 12 * 3600:
+        delta -= 86400
     return time.time() + delta
 
 
@@ -264,6 +272,10 @@ class CityRest:
     def _save(self, entries: list[RestEntry]) -> None:
         save_state(entries, self.state_path)
 
+    def save(self, entries: list[RestEntry]) -> None:
+        """公开的保存入口（供新流程清理已回城的补兵标记）。"""
+        self._save(entries)
+
     def _mark(self, name: str, kind: str = "执行", note: str = "") -> None:
         if self.timer is not None:
             self.timer.mark(name, kind, stage=STAGE_MOBILIZE, note=note)
@@ -271,12 +283,18 @@ class CityRest:
     # -- 选城 -------------------------------------------------------------
     @staticmethod
     def _filter_cities(camps: list[Camp], exclude: Camp | None) -> list[Camp]:
+        from .alliance import NO_MOBILIZE_HINTS
+
         cities: list[Camp] = []
         for c in camps:
             kind = c.kind or c.kind_text
             if any(bad in kind for bad in CITY_EXCLUDE_HINTS):
                 continue
             if not any(hint in kind for hint in CITY_KIND_HINTS):
+                continue
+            # 缓存来自 OCR 列表时会把「无法入驻 / 枢要之地」的行也存进来，
+            # 这类城点进去没有「调动」，必须先排除（否则白跑一次选城）
+            if any(h in (c.note or "") for h in NO_MOBILIZE_HINTS):
                 continue
             if exclude is not None and tuple(c.coord) == tuple(exclude.coord):
                 continue

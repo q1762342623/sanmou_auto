@@ -5,8 +5,13 @@
 做一个「三谋」（三国谋定天下，`com.bilibili.nslg`）自动化程序。
 
 - 运行载体：MuMu 模拟器 + adb（仅外部截图与模拟触摸，不注入、不读内存、不改包）
-- 最终能力：**邮件指令识别**、**自动化战斗**
-- 交付形态：功能以可被上层 agent「大肥鱼」调用的 skill 形式提供，而不是固定脚本流程
+- 最终能力：**战报热点驱动的自动拉线**、**战报自动收集**、**自动化战斗**
+- 交付形态：功能以可被上层 agent 调用的 skill 形式提供，而不是固定脚本流程
+
+> **邮件链路已彻底删除**：`mail.py` / `flow_mail.py` / `flow_mobilize.py` /
+> `flow_loop.py` / `flow_line_report.py`、`battle.BattleFlow` 与
+> `skills/sanmou-email-rally/` 均已移除，不存在任何回退开关。
+> 战场只来自战报收集的 `coordinateHotspot.hottest`。
 
 ## 协作约定
 
@@ -14,36 +19,19 @@
 - 每个功能**单独设计、单独验证**，不预先编写总方案
 - 功能清单、接口、坐标与模板随功能一并提交
 
-## 交付形态：Markdown Skill + 少量原子脚本
+## 交付形态：Markdown Skill + 原子指令
 
-**主要交付物**是 [`skills/sanmou-email-rally/`](../skills/sanmou-email-rally/)：
-一份写给 agent 看的 `SKILL.md` + 4 个单职责脚本（每个只输出一行 JSON），
-由上层 agent 自行编排，本仓库不包含 agent 调度逻辑。
-
-```
-skills/sanmou-email-rally/
-  SKILL.md                    玩法说明书：步骤、判定门槛、失败分支、汇报契约
-  reference/ui-coordinates.md 全部实测坐标与面板解剖
-  reference/keyword-rules.md  关键字白/黑名单与动作映射
-  scripts/screen.py           屏幕状态 / 截图 / OCR
-  scripts/mail.py             读邮件 / 打开指定邮件 / 点坐标跳转
-  scripts/camp.py             同盟建筑 + 同盟城池（城/水寨/军港/民港）：列据点 / 取最近 / 点选
-  scripts/troop.py            调动面板：列状态 / 派兵 / 记录到达时间
-```
-
-典型编排见 SKILL.md。本包内的 `flow_mail.py` / `flow_mobilize.py` 是**一键参考实现**，
-用于回归验证，不是必须的调用方式。
+- [`skills/三谋拉线与战报自动收集/`](../skills/三谋拉线与战报自动收集/)：
+  `SKILL.md` + 7 条原子指令（[`commands/`](commands/__init__.py)）+ 调度器
+  （[`atomic_loop.py`](atomic_loop.py)）+ 只读汇报（[`../tools/hotspot_status.py`](../tools/hotspot_status.py)）。
 
 ## 当前状态
 
-| 功能 | 状态 | Skill | 一键参考实现 |
-| --- | --- | --- | --- |
-| 功能一：读邮件 → 关键字 → 跳坐标 → 最近可调动据点 | ✅ 实测通过（2026-11-20） | `skills/sanmou-email-rally/SKILL.md` §1–3 | `python -m sanmou_auto.flow_mail` |
-| 功能二：最近 10 条同盟邮件 → 战场 → 最近可调动据点（大营/城/水寨/军港/民港）→ 调动 部队1-4 → 记录最后到达时间 | ✅ 实测通过（2026-11-20） | `skills/sanmou-email-rally/SKILL.md` §1–5 | `python -m sanmou_auto.flow_mobilize` |
-| 功能三：调动前兵力检查（不满点白色补兵，补后仍 <30000 跳过该队）+ 到达后按邮件 集结/攻占/行军；邮件不可执行时先找红色敌对目标，视野无红敌则用「战报」绿色坐标 → 攻城；处理「未携带满战法」确认框；打完回据点 → 回城 | ✅ 实测通过（2026-11-21 14:06，4 队出征→返回→回城） | `skills/sanmou-email-rally/SKILL.md` §4.4–4.6 | `python -m sanmou_auto.flow_mobilize`（默认含战斗） |
-| **自动拉线**：循环「邮件分析战场 → 调动据点 → 寻找敌方进攻 → 回家补兵」，统计每轮每个节点耗时；据点列表跨轮缓存（省掉每轮 ≈340s 的同盟列表扫描）；**低兵力部队进城自动征兵、征满后每轮调兵前召回主城** | ✅ 实测通过（2026-11-21，单轮 + 1 小时长跑见 [`docs/自动拉线.md`](docs/自动拉线.md)） | — | `python -m sanmou_auto.flow_loop` |
-| **战报自动收录**：进「战报→同盟→交战」→ 逐卡展开 + 滑到底（adb 触控），同时设备内 tcpdump 抓游戏流量 → pcap 解出 BLOB → 增量 HMAC 上传报表服务器 → 等 `/api/live` 可见；1600x900 横屏实测（3 页 / 6 BLOB / 34 条记录，29s 一轮） | ✅ 实测通过（2026-11-21，ingestVersion 10414） | [`skills/战报自动收录/SKILL.md`](skills/战报自动收录/SKILL.md) | `python skills/战报自动收录/scripts/round.py` |
-| **自动拉线与战报收集**：自动拉线循环 + 把战报收录插到空闲时间（等战斗结束/轮间隔/节点安全点），**距上一次提交成功 ≥10 分钟必收**（空闲点另需距上次收集结束 ≥5 分钟）；上传失败的采集进补交队列；收集前后自动回到世界地图 | ✅ 代码完成（`--report-submit-interval` 600s + `--report-interval` 300s；`pendingUploads` 自动补交） | — | `python -m sanmou_auto.flow_line_report` |
+| 功能 | 状态 | 入口 |
+| --- | --- | --- |
+| **三谋拉线与战报自动收集（原子指令 + 热点驱动）**：据点收集 → 主城坐标 → 战报收集（热点）→ 据点调动 → 补给兵力 → 部队进攻 → 部队撤回，任意两条业务指令之间必插一次完整战报收集 | ✅ 实机验证（2026-11-24/25） | `python -m sanmou_auto.atomic_loop --hours 13` |
+| **战报自动收录**：进「战报→同盟→交战」逐卡展开 + 滑到底，设备内 tcpdump → BLOB → 增量上传，并算最高频次交战坐标 | ✅ 实测通过（2026-11-21） | `python skills/战报自动收录/scripts/round.py` |
+| **13h 长跑守护**：定时汇报 / 掉线重连 / 异常与卡死重启 | ✅ 实测（`hotspot_supervisor`） | `python tools/hotspot_supervisor.py --spawn --hours 13` |
 
 ### 环境依赖
 
@@ -53,32 +41,18 @@ python -m pip install --no-input rapidocr-onnxruntime
 ```
 
 - adb：`C:\Program Files\Netease\MuMu\nx_main\adb.exe`
-- 设备：`127.0.0.1:16416`（1600x900 横屏）
+- 设备：`127.0.0.1:16416`（竖屏 900x1600）
 
 ### 快速开始
 
 ```bash
-python -m sanmou_auto.flow_mail --dry-run    # 只读 10 封邮件并解析关键字
-python -m sanmou_auto.flow_mail              # 读邮件 → 跳最近指令坐标 → 点最近可调动据点 → 截图
-python -m sanmou_auto.flow_mail --mode action --limit 5   # 跳坐标后点 攻城/占领/行军/驻守（不确认）
+python -m sanmou_auto.atomic_loop --specs                    # 7 条指令契约
+python -m sanmou_auto.atomic_loop --minutes 30               # 原子指令调度（默认引擎）
+python -m sanmou_auto.atomic_loop --hours 13                 # 13 小时长跑
+python -m sanmou_auto.atomic_loop --max-ticks 3 --dry-run    # 冒烟（不动手）
 
-python -m sanmou_auto.flow_mobilize                    # 邮件 → 战场 → 据点 → 调动 1-4 → 正面战斗 → 回城
-python -m sanmou_auto.flow_mobilize --troops 1,2,3     # 只调动 1-3 队（范围固定 1-4）
-python -m sanmou_auto.flow_mobilize --no-battle        # 只调动，不进入战斗
-python -m sanmou_auto.flow_mobilize --no-wait          # 出征后不等待战斗结束
-python -m sanmou_auto.flow_mobilize --min-strength 30000 --no-replenish  # 兵力门槛/关闭补兵
-python -m sanmou_auto.flow_mobilize --dry-run          # 只到点选最近可调动据点
-
-python -m sanmou_auto.flow_loop                        # 自动拉线：连跑 1 小时并统计每轮节点耗时
-python -m sanmou_auto.flow_loop --minutes 10           # 跑 10 分钟
-python -m sanmou_auto.flow_loop --max-rounds 1         # 只跑一轮（冒烟）
-
-python -m sanmou_auto.flow_line_report                 # 自动拉线 + 战报收集（空闲点 5 分钟一收；距上次提交 10 分钟必收）
-python -m sanmou_auto.flow_line_report --minutes 10    # 跑 10 分钟
-python -m sanmou_auto.flow_line_report --report-interval 240   # 收紧收集间隔
-python -m sanmou_auto.flow_line_report --report-skip-upload    # 只抓不上传
-python -m sanmou_auto.flow_line_report --no-report             # 等同自动拉线
-python -m sanmou_auto.home                              # 只跑「回家补兵」节点（回城→亲卫营→检查/补兵→出城）
+python tools/hotspot_supervisor.py --spawn --hours 13        # 后台守护 + 自动汇报
+python tools/hotspot_status.py                               # 只读进度（轮次/各指令耗时/战报）
 ```
 
 截图输出：`screenshots/flow/`（JPEG 宽 1000，单张 60–140KB，避免大图撑爆上下文）
@@ -87,23 +61,28 @@ python -m sanmou_auto.home                              # 只跑「回家补兵�
 
 ```
 sanmou_auto/
-  config.py       设备/分辨率/固定 UI 坐标
+  config.py       设备/分辨率/固定 UI 坐标（含右侧部队头像 / 回城按钮 / 回城弹窗）
   adb.py          screencap / tap / swipe / keyevent
   vision.py       低画质落盘、裁剪
   ocrengine.py    RapidOCR 封装 + 切块识别 ocr_tiled()
   intent.py       关键字白名单/黑名单 -> 动作，坐标正则
-  mail.py         邮件页读取（页签/翻页/正文/坐标点击点）
+  atomic_loop.py  **SKILL 调度器**：7 条原子指令编排 + 状态落盘 + 汇总 JSON
+  commands/       **7 条原子指令**：camps / home / reports / mobilize / replenish / attack / return
   alliance.py     同盟建筑 + 同盟城池（城/水寨/军港/民港）：列表、距离排序、跳转选中（校验「调动」）
-  mapnav.py       跳转弹窗、定位面板、右侧按钮列 OCR、截图、回到地图
+  mapnav.py       跳转弹窗、定位面板、右侧按钮列 OCR、回到地图（含部队总览/配将助手自救）
   mobilize.py     同盟大营「调动」：选部队卡、金色出征按钮、兵力读取/白色补兵、到达时间
-  battle.py       正面战斗：邮件按钮（集结/攻占/行军）、红色敌对目标检测、等待结束、回城
+  march.py        **热点行军/攻城**：OCR 动作列，攻城 > 行军（绝不攻占），灰色时试相邻地块
+  battle.py       地图战斗工具：红色敌对目标检测、动作按钮、回城（**不再含邮件流程**）
   home.py         回家补兵：回城 → 亲卫营 → 三队兵力检查/补兵 → 出城回地图
-  timing.py       步骤计时器：kind（分析/执行/等待）+ stage（四个节点）+ 汇总
-  report_collector.py **战报收集调度器**：等待分片、节点安全点、距上次提交≥10分钟必收、失败补交队列、状态持久化
-  flow_mail.py    功能一完整流程 + CLI
-  flow_mobilize.py 功能二+三完整流程 + CLI（战场 -> 大营 -> 调动 -> 战斗 -> 回城 -> 记录）
-  flow_loop.py    **自动拉线**循环：复用 flow_mobilize，逐轮统计节点耗时，写 json/jsonl
-  flow_line_report.py **自动拉线与战报收集**：自动拉线 + 在等待时间穿插战报收录
+  homecity.py     **我的主城坐标**：定位→建筑 第一条（与「城池」据点严格区分），带缓存
+  city_replenish.py **城池补兵**：离主城最近的城池 → 1-4 队全调动（沙盘直跳）
+  city_rest.py    低兵力歇兵登记 / 征满召回
+  netcamps.py     **抓包解同盟建筑**：tcpdump → XOR/sproto 解码（SANMOU_NETCAMPS=1）
+  fastwait.py     页面就绪轮询：截图指纹判「动画结束」，替代固定 sleep
+  timing.py       步骤计时器：kind（分析/执行/等待）+ stage + 汇总
+  report_collector.py **战报收集调度器**：等待分片、节点安全点、失败补交队列、状态持久化
+  hotspot.py      **战报热点**：从收集结果读取 hottest，跨轮跟踪与历史落盘
+  troop_return.py **右侧部队头像**：状态/ready 判断、点头像 → OCR 回城 → 「今天登录不再提示」→ 确定
 ```
 
 ### 调试工具
@@ -111,6 +90,7 @@ sanmou_auto/
 ```
 tools/snap.py             低画质截屏 / 裁剪
 tools/flow_probe.py       逐步点击 + 截图 / 区域 OCR
+tools/_hotspot_logic_test.py 热点解析/坐标比较/行军候选顺序 离线自测
 tools/ocr_calib.py        离线区域 OCR 校准（打印每段文字坐标）
 tools/locate_probe.py     定位面板逐页探测
 tools/map_label_probe.py  地图标签 OCR 探测
@@ -119,4 +99,10 @@ tools/red_probe.py        红色敌对目标检测离线标定（--synthetic 自
 tools/enemy_label_probe.py 地图标签 OCR + 文字像素红色占比（识别敌方红字）
 tools/label_color_probe.py 区域颜色采样（校准标签/坐标颜色阈值）
 tools/report_jump_probe.py 战报绿色坐标 → 跳转 → 战斗按钮 实时探测
+tools/pcap_probe.py       tcpdump 探查：--flows/--strings/--packed/--tree/--hex/--capture
+tools/_flow_timing_summary.py 汇总历史 auto_line_*.jsonl 的节点/步骤耗时（旧数据）
+tools/_camps_bench.py     抓包解据点 vs OCR 扫表 的耗时对比
+tools/_homecity_probe.py  定位面板「建筑」第一条（主城）探测
+tools/_sandbox_city_probe.py 沙盘坐标直跳 → 选中城池 → 右侧「调动」按钮 验证
+tools/_city_dispatch_probe.py 城池候选（按距主城）与沙盘可调动性探测
 ```

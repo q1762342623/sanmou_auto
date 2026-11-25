@@ -22,7 +22,7 @@ import re
 import time
 from dataclasses import dataclass
 
-from . import config, ocrengine, vision
+from . import config, fastwait, ocrengine, vision
 from .adb import Adb
 from .mapnav import COORD_RE, MapNav
 
@@ -140,10 +140,19 @@ class AllianceFacilities:
         return None
 
     def _open_tab(self, name: str, fallback: tuple[int, int],
-                  wait: float = 2.2) -> None:
+                  wait: float = 2.2, settle_box=None) -> None:
+        """点页签并等目标区域「动画结束」，最多等 wait 秒。
+
+        旧实现固定 `time.sleep(2.2)`；实测页签切换 0.4~1.0s 就完成，
+        用 `fastwait.wait_settle` 能省掉每轮 5~7 次多余的 1~1.5s。
+        """
         point = self._find_tab(name) or fallback
-        self.adb.tap(*point)
-        time.sleep(wait)
+        if settle_box is not None:
+            fastwait.tap_settle(self.adb, point, box=settle_box, timeout=wait,
+                                min_wait=0.25)
+        else:
+            self.adb.tap(*point)
+            time.sleep(wait)
 
     # -- 打开 / 返回 -------------------------------------------------------
     def open_alliance_home(self, wait: float = 3.0, tries: int = 2) -> bool:
@@ -161,23 +170,23 @@ class AllianceFacilities:
                 self._page = "alliance"
                 return True
             if self._page in ("facility", "cities"):
-                self.adb.tap(*FACILITY_BACK)
-                time.sleep(1.0)
+                fastwait.tap_settle(self.adb, FACILITY_BACK, box=TAB_ROW_BOX,
+                                    timeout=1.4, min_wait=0.2)
                 self._page = "alliance"
                 continue
             if self.nav.chat_panel_visible():
                 self.nav.close_chat_panel()
                 continue
-            self.adb.tap(*ALLIANCE_ENTRY)
-            time.sleep(wait)
+            fastwait.tap_settle(self.adb, ALLIANCE_ENTRY, box=TAB_ROW_BOX,
+                                timeout=wait, min_wait=0.4)
             self._page = "alliance"
         ok = "城池" in "".join(t for t, _ in self._tabs_text())
         if not ok:
             # 可能卡在别的面板（部队详情/聊天）：强制回地图后再开一次
             self.log("  ! 没能确认「同盟」主页面，先强回地图再试")
             self.nav.ensure_map()
-            self.adb.tap(*ALLIANCE_ENTRY)
-            time.sleep(wait)
+            fastwait.tap_settle(self.adb, ALLIANCE_ENTRY, box=TAB_ROW_BOX,
+                                timeout=wait, min_wait=0.4)
             ok = "城池" in "".join(t for t, _ in self._tabs_text())
         self._page = "alliance" if ok else "map"
         if not ok:
@@ -188,21 +197,22 @@ class AllianceFacilities:
         """同盟 → 设施 → 左栏「同盟建筑」。找不到该筛选时返回 False。"""
         if not self.open_alliance_home():
             return False
-        self._open_tab("设施", FACILITY_TAB, wait=2.2)
+        self._open_tab("设施", FACILITY_TAB, wait=2.2, settle_box=LEFT_PANEL_BOX)
         self._page = "facility"
         point = self._find_in(LEFT_PANEL_BOX, "同盟建筑", scale=2.5)
         if not point:
             self.log("  ! 设施页没有「同盟建筑」筛选（该盟当前可能没有大营）")
             return False
-        self.adb.tap(*point)
-        time.sleep(1.8)
+        # 表格是服务端下发的，切换筛选后要等它「静止」，固定 sleep 1.8 常白等
+        fastwait.tap_settle(self.adb, point, box=LIST_BOX, timeout=2.4,
+                            min_wait=0.3)
         return True
 
     def open_cities_page(self, wait: float = 2.5) -> bool:
         """同盟 → 城池（城 / 水寨 / 军港 / 民港 的完整列表）。"""
         if not self.open_alliance_home():
             return False
-        self._open_tab("城池", CITY_TAB, wait=wait)
+        self._open_tab("城池", CITY_TAB, wait=wait, settle_box=CITY_TEXT_BOX)
         self._page = "cities"
         return True
 
@@ -294,9 +304,11 @@ class AllianceFacilities:
 
     # -- 扫描 -------------------------------------------------------------
     def scroll_cities_to_top(self, times: int = 5, wait: float = 0.5) -> None:
+        """回顶：滑动后只等列表「静止」，不再固定睡 0.5s×5。"""
         for _ in range(times):
             self.adb.swipe(*CITY_SCROLL_DOWN, 340)
-            time.sleep(wait)
+            fastwait.wait_settle(self.adb, box=CITY_TEXT_BOX,
+                                 timeout=max(0.6, wait), min_wait=0.12)
 
     def scan_cities(self, scrolls: int = CITY_MAX_PAGES) -> list[Camp]:
         """把城池列表从上滚到底，收集全部据点（去重）。"""
@@ -316,7 +328,8 @@ class AllianceFacilities:
                 found.setdefault(c.coord, c)
             if i < scrolls:
                 self.adb.swipe(*CITY_SCROLL, 450)
-                time.sleep(1.0)
+                fastwait.wait_settle(self.adb, box=CITY_TEXT_BOX,
+                                     timeout=1.3, min_wait=0.15)
         self.log(f"  城池列表共解析到 {len(found)} 个据点")
         return list(found.values())
 
@@ -342,7 +355,8 @@ class AllianceFacilities:
                 if c.coord == coord:
                     return c
             self.adb.swipe(*LIST_SCROLL, 450)
-            time.sleep(0.9)
+            fastwait.wait_settle(self.adb, box=LIST_BOX, timeout=1.2,
+                                 min_wait=0.12)
         return None
 
     def read_city_name(self, point: tuple[int, int]) -> str:
@@ -388,13 +402,15 @@ class AllianceFacilities:
         start = max(0, camp.page - 2)
         for _ in range(start):
             self.adb.swipe(*CITY_SCROLL, 450)
-            time.sleep(0.6)
+            fastwait.wait_settle(self.adb, box=CITY_TEXT_BOX,
+                                 timeout=0.9, min_wait=0.1)
         for _ in range(start + 7):
             for c in self.parse_cities():
                 if c.coord == camp.coord:
                     return self._fill_city_name(c)
             self.adb.swipe(*CITY_SCROLL, 450)
-            time.sleep(0.9)
+            fastwait.wait_settle(self.adb, box=CITY_TEXT_BOX,
+                                 timeout=1.2, min_wait=0.12)
         if not full_scan or start == 0:
             return None
         # 屏号估计不准时回顶完整扫一遍（慢，只在最后一个候选时走）
@@ -404,7 +420,8 @@ class AllianceFacilities:
                 if c.coord == camp.coord:
                     return self._fill_city_name(c)
             self.adb.swipe(*CITY_SCROLL, 450)
-            time.sleep(0.9)
+            fastwait.wait_settle(self.adb, box=CITY_TEXT_BOX,
+                                 timeout=1.2, min_wait=0.12)
         return None
 
     def has_mobilize_button(self, attempts: int = 2) -> bool:
@@ -418,8 +435,12 @@ class AllianceFacilities:
         joined = "".join(btns)
         if MOBILIZE_BUTTON not in joined:
             return False
-        return any(k in joined for k in ("行军", "驻守", "总览", "征兵", "委任",
-                                         "整编", "生产辎重", "结义调动"))
+        # OCR 抖动实测：「征兵」常读成「证兵」，「生产辎重」读成「生产重」，
+        # 「委任」读成「委托」，「行军」偶尔被聊天气泡挡掉 —— 用宽松词表 + 按钮数兜底。
+        if any(k in joined for k in ("行军", "驻守", "总览", "征兵", "证兵",
+                                     "委任", "委托", "整编", "生产", "结义")):
+            return True
+        return len(btns) >= 3
 
     def read_selected_identity(self) -> tuple[str, str]:
         """跳转选中后，从左上面板读「名称 + 类型」，例如 (藏舟寨, 水寨)。"""
@@ -454,11 +475,15 @@ class AllianceFacilities:
         rows = self.parse_cities() if camp.source == "city" else self.parse()
         return next((c for c in rows if c.coord == camp.coord), None)
 
-    def _tap_row_coord(self, camp: Camp, tries: int = 3) -> bool:
+    def _tap_row_coord(self, camp: Camp, tries: int = 3,
+                       allow_no_dialog: bool = False) -> bool:
         """点坐标并等跳转框；没弹框说明列表滑动/页面动画导致点歪，重新定位再点。
 
         实测设施页刚滑入时点坐标常常不弹框，因此每次点击带 ±6px 偏移重试，
         并且每次点完都回读一次列表（坐标文字位置可能变）。
+
+        `allow_no_dialog=True`：城池列表点坐标有时**直接跳转、不弹框**，
+        这时也按成功返回，由调用方用「调动按钮」再验证一次（避免整段白跑）。
         """
         for i in range(max(1, tries)):
             cur = self._row_on_screen(camp)
@@ -468,11 +493,19 @@ class AllianceFacilities:
                 point = (cur.point[0] + dx, cur.point[1])
                 self.log(f"  · 点击坐标 {point}")
                 self.adb.tap(*point)
-                time.sleep(1.3)
-                if jump_dialog_visible(self.adb):
+                # 弹框一般 0.4~0.8s 就出来：轮询替代固定 1.3s
+                ok, _text = fastwait.wait_text(
+                    self.adb, config.JUMP_DIALOG_BOX,
+                    ("跳转到坐标", "是否跳转"), timeout=1.4, scale=2.0,
+                    min_wait=0.25)
+                if ok:
                     return True
+            if allow_no_dialog:
+                self.log("  · 没弹出跳转框：按「已直接跳转」处理，交给按钮校验")
+                return True
             self.log("  · 没弹出跳转框（页面还在动/点歪），重新定位再点")
-            time.sleep(0.8)
+            fastwait.wait_settle(self.adb, box=LIST_BOX, timeout=1.0,
+                                 min_wait=0.2)
         return False
 
     def reselect(self, camp: Camp) -> bool:
@@ -499,20 +532,28 @@ class AllianceFacilities:
             if not self.open_union_buildings():
                 return False
             hit = self.find_union_row(camp.coord)
-        time.sleep(0.8)                 # 等列表滑入动画结束，否则点坐标不弹跳转框
+        # 等列表滑入动画结束（用画面静止判定，比固定 0.8s 快且更稳）
+        fastwait.wait_settle(self.adb, box=CITY_TEXT_BOX if camp.source == "city"
+                             else LIST_BOX, timeout=1.4, min_wait=0.2)
         if not hit:
             self.log(f"  ! 列表里找不到 {camp.coord}，跳过")
             return False
 
         self.log(f"== 点击 {camp.describe()} 的坐标 @{hit.point}")
+        # 城池列表点坐标有时直接跳转（不弹「是否跳转到坐标」），不能因此判失败
+        allow_no_dialog = camp.source == "city"
         for i in range(2):
-            if not self._tap_row_coord(camp):
+            if not self._tap_row_coord(camp, allow_no_dialog=allow_no_dialog):
                 self.log("  ! 没弹出「是否跳转到坐标」，可能点歪了")
                 continue
-            self.adb.tap(*config.CONFIRM_JUMP)
-            time.sleep(confirm_wait)
+            if jump_dialog_visible(self.adb):
+                self.adb.tap(*config.CONFIRM_JUMP)
+            else:
+                self.log("  · 没有跳转弹框（直接跳转），跳过确认")
+            # 点确定后：等地图把目标移到屏幕中间、右侧按钮列出现（画面静止）
+            fastwait.wait_settle(self.adb, box=config.ACTION_BOX,
+                                 timeout=max(1.6, confirm_wait), min_wait=0.4)
             self._page = "map"              # 跳转确认后会回到地图
-            time.sleep(0.3)
             if self.has_mobilize_button():
                 return True
             self.log(f"  ! 跳转后没看到「行军/调动」按钮，重试一次（{i + 1}/2）")

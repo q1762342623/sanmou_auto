@@ -201,11 +201,11 @@ python scripts/upload.py --capture-id <captureId>
 
 ## 6. 边界与约束
 
-1. **同一台模拟器同一时间只能跑一个自动化**：与「自动拉线」(`flow_loop`) 互斥，
+1. **同一台模拟器同一时间只能跑一个自动化**：与
+   「三谋拉线与战报自动收集」(`python -m sanmou_auto.atomic_loop`) 互斥，
    否则触控会互相打断；先停一边。
-   已提供串行整合版 `python -m sanmou_auto.flow_line_report`
-   （自动拉线 + 在等待/节点安全点插入本技能，距上次提交 ≥10 分钟必收，
-   收集前后自动回世界地图）；该模式运行期间不要再手动并发跑 `round.py`。
+   原子调度器已把本技能串行化（收集前后自动回世界地图，失败进补交队列）；
+   长跑期间不要再手动并发跑 `round.py`。
 2. 只做外部截图 + `input tap/swipe`，不注入、不 hook、不改包。
 3. 不按 Android BACK 关面板（会弹「确认退出」），一律点页面自带返回箭头。
 4. pcap、截图、tcpdump.log **只留在本地**，上传的只有 `blobs/` + 元数据。

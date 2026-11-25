@@ -38,7 +38,11 @@ HINT_BOX = (0, 1160, 700, 1230)
 GO_BOX = (700, 1225, 860, 1300)
 # 底部「地点信息」条可能出现在两个位置（随右侧动作列/浮层高度变化）
 SELECTED_BOXES = ((0, 830, 900, 975), (0, 1380, 900, 1480))
-# 右括号经常被 OCR 吞掉（实测只读到「建业台（696,781」），所以闭合括号可选
+# 右括号经常被 OCR 吞掉（实测只读到「建业台（696,781」），所以闭合括号可选。
+# 但坐标后面常粘着等级/数量（实测 (626,759) 读成 626,7591），
+# 因此先用「带右括号的严格式」，失败再用宽松式并做范围校验/截断。
+SELECTED_STRICT_RE = re.compile(
+    r"[（(]\s*(\d{1,3})\s*[,，]\s*(\d{1,3})\s*[)）]")
 SELECTED_RE = re.compile(r"[（(]?\s*(\d{1,3})\s*[,，]\s*(\d{1,4})")
 
 
@@ -59,6 +63,24 @@ class SandboxJump:
             return True
         go = ocrengine.ocr_text(vision.crop(img, GO_BOX), 2.0)
         return "前往" in go
+
+    def close(self, max_pinches: int = 3, settle: float = 1.0) -> bool:
+        """退出沙盘页（双指外扩放大回到普通地图）。
+
+        `ensure_map` / 列表选城都依赖「世界地图」，停在沙盘页时底栏是
+        「城池/战没/同盟/个人」，点同盟入口会打开排行榜，后续全部失败。
+        """
+        if not self.visible():
+            return True
+        for i in range(max(1, max_pinches)):
+            self.log(f"  · 退出沙盘页（放大 {i + 1}/{max_pinches}）")
+            self.adb.pinch("in", steps=16, radius=0.9)
+            time.sleep(settle)
+            if not self.visible():
+                self._open = False
+                return True
+        self._open = False
+        return not self.visible()
 
     def ensure_open(self, max_pinches: int = 6, settle: float = 1.1) -> bool:
         """不在沙盘页就双指收拢，直到出现（最多 max_pinches 次）。
@@ -95,12 +117,41 @@ class SandboxJump:
         img = self.adb.screencap()
         for box in SELECTED_BOXES:
             text = ocrengine.ocr_text(vision.crop(img, box), 2.0)
-            m = SELECTED_RE.search(text)
+            flat = text.replace(" ", "")
+            point = None
+            m = SELECTED_STRICT_RE.search(flat)
             if m:
-                try:
-                    return int(m.group(1)), int(m.group(2))
-                except ValueError:
-                    continue
+                point = self._valid_coord(m.group(1), m.group(2))
+            else:
+                m = SELECTED_RE.search(flat)
+                if m:
+                    point = self._valid_coord(m.group(1), m.group(2))
+            if point:
+                return point
+        return None
+
+    @staticmethod
+    def _valid_coord(raw_x: str, raw_y: str) -> tuple[int, int] | None:
+        """校验 OCR 坐标；处理「(626,759) 读成 626,7591」的粘连。"""
+        try:
+            x, y = int(raw_x), int(raw_y)
+        except ValueError:
+            return None
+        if x > 2000:
+            return None
+        if y > 2000:
+            # 常见：759 + 后面一两位等级/数量 → 取前 3 位
+            text = str(raw_y)
+            for cut in (3, 2):
+                if len(text) > cut:
+                    try:
+                        y = int(text[:cut])
+                    except ValueError:
+                        continue
+                    if y <= 2000:
+                        break
+        if 0 < x < 2000 and 0 < y < 2000:
+            return x, y
         return None
 
     # ------------------------------------------------------------------ 跳转
@@ -135,6 +186,7 @@ class SandboxJump:
         for attempt in range(1, max(1, tries) + 1):
             if not self._jump_once(target, tap_center, wait):
                 self.log(f"  ! 没能进入沙盘页（第 {attempt}/{tries} 次），放弃坐标快跳")
+                self._safe_close()
                 return False
             got = self.selected_coord() if tap_center else None
             if got is None or got == target:
@@ -146,7 +198,15 @@ class SandboxJump:
             self.adb.swipe(450, 700, 520, 700, 200)
             time.sleep(0.6)
         self._open = False
+        # 失败时不要停在缩放/沙盘页：后续「回城」等操作都依赖世界地图
+        self._safe_close()
         return False
+
+    def _safe_close(self) -> None:
+        try:
+            self.close(max_pinches=3)
+        except Exception as error:          # noqa: BLE001
+            self.log(f"  ! 退出沙盘页失败：{error!r}")
 
     def select_center(self, wait: float = 1.2) -> None:
         self.adb.tap(*P_CENTER)

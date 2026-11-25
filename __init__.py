@@ -7,5 +7,6 @@
 
 from . import _nowin  # noqa: F401  导入即启用「子进程不弹 CMD 框」
 
-__all__ = ["config", "adb", "vision", "ocrengine", "intent", "mail", "mapnav",
-           "report_collector", "flow_line_report", "_nowin"]
+__all__ = ["config", "adb", "vision", "ocrengine", "intent", "mapnav",
+           "report_collector", "hotspot", "troop_return", "march",
+           "atomic_loop", "_nowin"]

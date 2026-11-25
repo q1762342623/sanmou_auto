@@ -211,10 +211,26 @@ class ReportCollector:
         return min(waits) if waits else 0.0
 
     # ------------------------------------------------------------ 触发点
-    def wait(self, seconds: float) -> None:
-        """分片等待；期间到点就立刻插一次战报收集。"""
+    def wait(self, seconds: float, collect_first: bool | None = None) -> None:
+        """分片等待；期间到点就立刻插一次战报收集。
+
+        `collect_first`：进入等待前先立刻做一次完整战报收集。
+        用户口径（2026-11-24）：**战报收集优先级最高**，只要当前指令做完、
+        下一步需要等待（尤其「调动命令刚下达完」），就先收集再等；
+        `None` = 自动（等待 ≥120s 就先收一次，短等待不打断节奏）。
+        """
         remaining_total = max(0.0, float(seconds))
         end = time.monotonic() + remaining_total
+        if collect_first is None:
+            collect_first = remaining_total >= 120.0
+        if collect_first and self.enabled and not self._busy:
+            # 距上次开始太近（<60s）才跳过，避免自激循环
+            too_soon = (self._last_start is not None
+                        and time.time() - self._last_start < 60.0)
+            if not too_soon:
+                self.collect(trigger="等待前")
+                if end - time.monotonic() <= 0:
+                    return
         while True:
             remaining = end - time.monotonic()
             if remaining <= 0:

@@ -1,23 +1,18 @@
-"""正面战斗：邮件驱动的「集结 / 攻占 / 行军」+ 红色敌对目标兜底 + 回城。
+"""地图战斗操作（不含邮件）：红色敌对目标 / 动作按钮 / 回城 / 战报坐标。
 
-流程（在 `flow_mobilize` 把部队调动到最近据点之后执行）：
-1. **邮件能执行**：重新打开那封邮件 → 点正文绿色坐标 → 确认跳转（相机到战场并选中地块），
-   然后在右侧竖排按钮里按动作优先级点 `攻占/占领/攻城/攻击/攻打/行军/集结`，
-   点完出现与「调动」同款的出征面板（5 张部队卡 + 金色「出征」）。
-2. **邮件意义不明 / 地图上执行不了**（没坐标、没命中关键字、没有对应按钮）：
-   先在可视地图里按颜色找高饱和红色块（敌对标签/血条），点它 → 右侧出现
-   `攻打/攻击/攻占/行军` 就出征，没有就换下一个红色目标（对撞产生战斗）。
-   视野内确实没有红敌时，打开左下「战报」→ 读「防守/交战」记录头部的**绿色坐标**
-   → 点它跳转 → 再按 `攻城/攻占/行军` 出征（实测 7级木材(709,767) 出「攻城」）。
-3. 出征后若弹出「部队未携带满战法，是否继续出征？」→ 自动点「继续出征」。
-4. 派兵复用 `Mobilizer`（含「兵力不满先点白色补兵、补完仍 <30000 就跳过」）。
-5. 等战斗结束（按到达时间 + 60s 预判，再轮询据点面板确认不再「行军/出征」），
-   重新选中据点，点左下角「回城」回老家（城内视角：君王殿/研究所/亲卫营）。
-   即使最终没找到可打目标，也会回据点并回城，保证流程收尾。
+保留内容（热点驱动链路与只读探针共用）：
+1. `BattleCommander`：可视地图按颜色找高饱和红色块（敌对标签/血条），点它 → 右侧
+   出现 `攻打/攻击/攻占/行军` 就出征；也可打开左下「战报」读绿色坐标跳转；
+2. 回城：重新选中据点 → 左下「回城」→ 处理「确认退出/今日登录不再提示」弹窗；
+3. `find_red_targets` / `red_clusters` / `find_green_clusters`：纯图像识别工具，
+   供 `tools/red_probe.py` 等只读探针复用。
+
+**邮件链路已从本工程删除**：`mail.py`、`flow_mail.py`、`flow_mobilize.py`、
+`flow_loop.py`、`flow_line_report.py` 及其 CLI 入口均已移除；正式长跑只走
+`sanmou_auto.atomic_loop`（原子指令 + 战报热点）。
 
 实测要点（1600x900）：
 - 右侧按钮列在 x≈1075–1215，必须窄条 OCR（`MapNav.find_all_buttons`）。
-- 出征面板与「调动」面板同款，可直接复用 `Mobilizer.panel_open/read_statuses/dispatch_one`。
 - 回城按钮实测 bbox = (22,712)–(176,884)，点中心 (99,798)。
 """
 from __future__ import annotations
@@ -28,10 +23,9 @@ import time
 
 from PIL import Image
 
-from . import config, intent, ocrengine, vision
+from . import config, fastwait, intent, ocrengine, vision
 from .adb import Adb
-from .mail import MailBody, MailReader
-from .mapnav import MapNav
+from .mapnav import MOBILIZE_PANEL_HINT_BOX, MapNav
 from .mobilize import Mobilizer, _to_seconds
 from .timing import STAGE_ATTACK, STAGE_HOME
 
@@ -412,339 +406,13 @@ class BattleCommander:
             for point in RETURN_HOME_POINTS:
                 self.log(f"== 点击回城按钮 @{point}")
                 self.adb.tap(*point)
-                time.sleep(2.5)
-                # 城内视角：能 OCR 到 君王殿/研究所/亲卫营；或世界地图底栏消失
-                if self.in_city_view() or not self.nav.on_map():
+                # 城内视角 ~0.8~1.8s 加载：轮询命中即返回，替代固定 2.5s
+                if fastwait.wait_until(
+                        self.adb,
+                        lambda img: self.in_city_view(img),
+                        timeout=3.0, interval=0.3, min_wait=0.5) \
+                        or not self.nav.on_map():
                     self.log("  ✓ 已回城（离开世界地图 / 城内视角）")
                     return True
             self.log(f"  · 第{i + 1}次点「回城」没生效，重试")
         return self.in_city_view() or not self.nav.on_map()
-
-
-class BattleFlow:
-    """一次完整的「到战场 → 出征 → 打完 → 回据点 → 回城」编排。"""
-
-    def __init__(self, adb: Adb | None = None, log=print, timer=None):
-        self.adb = adb or Adb()
-        self.nav = MapNav(self.adb, log=log)
-        self.reader = MailReader(self.adb, log=log)
-        self.cmd = BattleCommander(self.adb, log=log)
-        self.log = log
-        self.mob: Mobilizer | None = None
-        self._reopen = None                 # 面板被收起时的「重新选中目标」回调
-        self._enemy_point: tuple[int, int] | None = None
-        # 可选的阶段计时器（与 flow_mobilize 共用同一轮）
-        self.timer = timer
-
-    def _mark(self, name: str, kind: str = "执行", note: str = "",
-              stage: str = STAGE_ATTACK) -> None:
-        if self.timer is not None:
-            self.timer.mark(name, kind=kind, note=note, stage=stage)
-
-    # -- 目标面板 ---------------------------------------------------------
-    def _panel_open(self) -> bool:
-        return bool(self.mob and self.mob.panel_open())
-
-    def _reopen_panel(self) -> bool:
-        if callable(self._reopen):
-            return bool(self._reopen())
-        return False
-
-    def _jump_mail(self, mail: MailBody) -> MailBody | None:
-        """重新打开邮件 → 点正文坐标 → 确认跳转。"""
-        try:
-            body = self.reader.open_mail_at(mail)
-        except Exception as e:                  # 邮件页异常时不阻塞战斗兜底
-            self.log(f"  × 重新打开邮件失败：{e}")
-            return None
-        if body.coord_point is None:
-            self.log("  × 邮件正文没有可点击坐标，无法跳转")
-            self.reader.back()
-            return None
-        coord = body.intent.coord if body.intent else None
-        self.log(f"== 邮件坐标跳转 {coord or ''} @{body.coord_point}")
-        self.adb.tap(*body.coord_point)
-        time.sleep(1.4)
-        if self.nav.jump_dialog_visible():
-            self.nav.confirm_jump(2.8)
-        else:
-            self.log("  ! 未检测到跳转弹窗，按已跳转处理")
-        return body
-
-    def _click_action(self, names: tuple[str, ...],
-                      timeout: float = 8.0) -> str:
-        """在地块右侧按钮里点战斗按钮，成功（出现出征面板）返回按钮文字。"""
-        name, point, labels = self.cmd.wait_action_button(names, timeout=timeout)
-        self.log("  地块按钮: " + (", ".join(labels) or "无"))
-        if not name:
-            self.log(f"  × 没有可用的战斗按钮（候选 {names}）")
-            return ""
-        self.log(f"== 点击战斗按钮「{name}」@{point}")
-        self.adb.tap(*point)
-        time.sleep(1.8)
-        if self._panel_open():
-            return name
-        self.log("  ! 点完战斗按钮没看到出征面板")
-        return ""
-
-    def _open_mail_target(self, mail: MailBody, names: tuple[str, ...],
-                          result: dict | None = None) -> tuple[bool, str]:
-        body = self._jump_mail(mail)
-        if body is None:
-            return False, ""
-        if result is not None:
-            result["shots"].append(
-                self.nav.shoot(f"b1_战场_{time.strftime('%H%M%S')}"))
-        name = self._click_action(names)
-        if not name:
-            # 邮件动作与地块按钮名不一致（如「集结」邮件落到敌方格只有「攻打」）
-            self.log("  · 地块没有邮件动作按钮，改试其它战斗按钮")
-            name = self._click_action(DEFAULT_ACTION_BUTTONS, timeout=3.0)
-        if not name:
-            return False, ""
-        all_names = tuple(dict.fromkeys(names + DEFAULT_ACTION_BUTTONS))
-        self._reopen = lambda: self._reopen_mail_target(mail, all_names)
-        return True, name
-
-    def _reopen_mail_target(self, mail: MailBody,
-                            names: tuple[str, ...]) -> bool:
-        self.nav.ensure_map()
-        if self._jump_mail(mail) is None:
-            return False
-        if self._click_action(names, timeout=6.0):
-            return True
-        return bool(self._click_action(DEFAULT_ACTION_BUTTONS, timeout=3.0))
-
-    def _open_enemy_target(self, result: dict | None = None) -> tuple[bool, str]:
-        """邮件意义不明时：找红色敌对目标对撞。"""
-        self.nav.ensure_map()
-        cands = self.cmd.find_red_targets()
-        if not cands:
-            self.log("  · 严格阈值没找到红色目标，放宽阈值再试")
-            cands = self.cmd.find_red_targets(relaxed=True)
-        if not cands:
-            self.log("  × 可视地图里没找到红色敌对目标")
-            return False, ""
-        for i, c in enumerate(cands):
-            self.nav.ensure_map()
-            self.log(f"== 敌对目标#{i + 1} ({c['x']},{c['y']}) "
-                     f"红色像素 {c['count']} 距中心 {c['dist']}")
-            self.adb.tap(c["x"], c["y"])
-            time.sleep(1.8)
-            name = self._click_action(DEFAULT_ACTION_BUTTONS, timeout=4.0)
-            if not name:
-                self.log("  · 该红色目标没有战斗按钮，换下一个")
-                continue
-            self._enemy_point = (c["x"], c["y"])
-            self._reopen = self._reopen_enemy_target
-            if result is not None:
-                result["enemy_target"] = [c["x"], c["y"]]
-            return True, name
-        return False, ""
-
-    def _reopen_enemy_target(self) -> bool:
-        self.nav.ensure_map()
-        if self._enemy_point:
-            self.adb.tap(*self._enemy_point)
-            time.sleep(1.6)
-            if self._click_action(DEFAULT_ACTION_BUTTONS, timeout=5.0):
-                return True
-        # 原目标消失（已被打掉/走开）→ 重新扫描红色目标
-        return self._open_enemy_target()[0]
-
-    def _open_report_target(self, result: dict | None = None) -> tuple[bool, str]:
-        """视野内找不到红色敌人时：用战报里最新一条交战的绿色坐标跳转并攻打。"""
-        if not self.cmd.open_battle_reports():
-            return False, ""
-        target = self.cmd.read_report_target()
-        if not target:
-            self.log("  × 战报里没有可点的绿色坐标")
-            self.cmd.close_battle_reports()
-            return False, ""
-        coord = target["coord"]
-        self.log(f"== 战报目标：{target['text']} 坐标 {coord} @{target['point']}")
-        self.adb.tap(*target["point"])
-        time.sleep(1.4)
-        if self.nav.jump_dialog_visible():
-            self.nav.confirm_jump(2.8)
-        else:
-            self.log("  ! 未检测到跳转弹窗，按已跳转处理")
-        if result is not None:
-            result["report_target"] = list(coord) if coord else None
-            result["report_text"] = target["text"]
-            result["shots"].append(
-                self.nav.shoot(f"b1b_战报_{time.strftime('%H%M%S')}"))
-        name = self._click_action(DEFAULT_ACTION_BUTTONS, timeout=6.0)
-        if not name:
-            if self.cmd.report_visible():
-                self.cmd.close_battle_reports()
-            return False, ""
-        self._reopen = self._reopen_report_target
-        return True, name
-
-    def _reopen_report_target(self) -> bool:
-        self.nav.ensure_map()
-        if not self.cmd.open_battle_reports():
-            return False
-        target = self.cmd.read_report_target()
-        if not target:
-            return False
-        self.adb.tap(*target["point"])
-        time.sleep(1.4)
-        if self.nav.jump_dialog_visible():
-            self.nav.confirm_jump(2.5)
-        return bool(self._click_action(DEFAULT_ACTION_BUTTONS, timeout=5.0))
-
-    # -- 等待/收尾 --------------------------------------------------------
-    def _wait_battle_return(self, camp, fac, indexes: tuple[int, ...],
-                            mr, timeout: float, wait_hook=None) -> bool:
-        """等部队打完并回到据点（面板里不再有「行军/出征 mm:ss」）。
-
-        `wait_hook(seconds)` 用来分片等待：自动拉线会在这里插入战报收集，
-        战报收集结束后仍继续等满剩余时间。
-        """
-        mob = self.mob
-        assert mob is not None
-        deadline = time.monotonic() + max(30.0, timeout)
-        # 先按「最后到达 + 60s」预判，避免每 20s 去重选据点（很慢）
-        if mr.last_arrival:
-            now = mob.clock.now()
-            a, b = _to_seconds(now), _to_seconds(mr.last_arrival)
-            if a is not None and b is not None:
-                wait = (b - a) % (24 * 3600) + BATTLE_EXTRA_SECONDS
-                wait = min(wait, max(30.0, timeout))
-                self.log(f"  预计 {wait:.0f}s 后战斗结束"
-                         f"（到达 {mr.last_arrival} + {BATTLE_EXTRA_SECONDS}s）")
-                _pause(max(0.0, wait), wait_hook)
-        if fac is None or camp is None:
-            # 没有据点上下文时无法重选据点轮询，按预估时间视为已结束
-            self.log("  · 缺少据点上下文，按等待时间视为战斗结束")
-            return True
-        deadline = max(deadline, time.monotonic() + 60.0)
-        fails = 0
-        while time.monotonic() < deadline:
-            fac.reselect(camp)
-            if mob.panel_open() or mob.open_from_camp():
-                sts = mob.read_statuses()
-                transit = [i for i in indexes
-                           if ":" in sts.get(i, "")
-                           and any(k in sts[i] for k in ("行军", "出征"))]
-                self.log("  战场核对：" + (", ".join(
-                    f"部队{k}={v}" for k, v in sorted(sts.items())) or "未识别"))
-                if not transit:
-                    self.log("  ✓ 部队已结束战斗/回到据点")
-                    mob.close()
-                    return True
-                fails = 0
-                self.log(f"  · 仍在途中: 部队{transit}")
-            else:
-                fails += 1
-                self.log(f"  · 打不开据点面板（{fails}/3）")
-                if fails >= 3:
-                    break
-            rest = deadline - time.monotonic()
-            _pause(max(1.0, min(POLL_SECONDS, rest)), wait_hook)
-        self.log("  ! 等待战斗结束超时（按已出征处理）")
-        mob.close()
-        return False
-
-    # -- 主流程 -----------------------------------------------------------
-    def run(self, camp, mail: MailBody | None, fac=None,
-            indexes: tuple[int, ...] = (1, 2, 3, 4),
-            min_strength: int = 30000, replenish: bool = True,
-            wait_return: bool = True, timeout: float = 900.0,
-            enemy_fallback: bool = True, wait_hook=None) -> dict:
-        """执行一次正面战斗。camp/fac 用来打完后回据点与回城。"""
-        result: dict = {
-            "ok": False, "mode": "battle", "shots": [],
-            "camp": camp.describe() if camp is not None else "",
-            "min_strength": min_strength,
-        }
-        self.adb.ensure_online()
-        self.nav.ensure_map()
-        self._mark("战斗准备", "准备")
-
-        self.mob = Mobilizer(self.adb, log=self.log,
-                             reselect=lambda: self._reopen_panel(),
-                             timer=self.timer)
-        mob = self.mob
-        opened, action = False, ""
-
-        # 1) 邮件指令：只有「可执行」的邮件才按动作点按钮
-        if (mail is not None and mail.intent is not None
-                and mail.intent.actionable):
-            names = ACTION_BUTTONS.get(mail.intent.action or "",
-                                       DEFAULT_ACTION_BUTTONS)
-            self.log(f"== 尝试按邮件执行：{mail.intent.describe()}")
-            opened, action = self._open_mail_target(mail, names, result)
-            if not opened:
-                self.log("  ! 邮件指令在地图上执行不了 → 改为红色敌对目标对撞")
-        elif mail is not None:
-            self.log("  ! 邮件意义不明（无可执行关键字/坐标）→ 红色敌对目标对撞")
-
-        # 2) 兜底 A：当前视野内找红色敌对目标
-        if not opened and enemy_fallback:
-            opened, action = self._open_enemy_target(result)
-        # 3) 兜底 B：视野里没有红敌 → 用「战报」里的交战坐标
-        if not opened and enemy_fallback:
-            self.log("  · 视野内没有红色目标，改用「战报」交战坐标")
-            opened, action = self._open_report_target(result)
-        self._mark("寻找战斗目标", "分析",
-                   note=(action or ("未找到" if not opened else "")))
-        if not opened:
-            result["reason"] = "no-battle-target"
-            # 即使没打到，也要回据点并回城，保证一次流程收尾
-            if fac is not None and camp is not None:
-                fac.reselect(camp)
-            result["shots"].append(
-                self.nav.shoot(f"b3_无目标_{time.strftime('%H%M%S')}"))
-            result["home"] = self.cmd.return_home()
-            result["shots"].append(
-                self.nav.shoot(f"b4_回城_{time.strftime('%H%M%S')}"))
-            if not result["home"]:
-                result["reason"] = "no-battle-target+home-failed"
-            self._mark("无目标收尾", "执行", stage=STAGE_HOME)
-            return result
-        result["action"] = action
-
-        # 3) 出征（复用 Mobilizer：兵力检查 + 补兵 + 金色出征）
-        mr = mob.mobilize(indexes=indexes, skip_busy=True,
-                          min_strength=min_strength, replenish=replenish,
-                          send_stationed=True)
-        mr.camp = result["camp"]
-        result.update(mr.as_dict())
-        result["shots"].append(
-            self.nav.shoot(f"b2_出征_{time.strftime('%H%M%S')}"))
-        mob.close()
-        self._mark("战斗出征", "执行")
-
-        # 4) 等战斗结束
-        if wait_return:
-            result["returned"] = self._wait_battle_return(
-                camp, fac, indexes, mr, timeout, wait_hook=wait_hook)
-            self._mark("等待战斗结束", "等待",
-                       note=f"最后到达 {mr.last_arrival or '-'}")
-
-        # 5) 回据点 + 回城
-        if fac is not None and camp is not None:
-            fac.reselect(camp)
-        result["shots"].append(
-            self.nav.shoot(f"b3_据点_{time.strftime('%H%M%S')}"))
-        result["home"] = self.cmd.return_home()
-        result["shots"].append(
-            self.nav.shoot(f"b4_回城_{time.strftime('%H%M%S')}"))
-        self._mark("回城", "执行", stage=STAGE_HOME)
-
-        dispatched = any(t.dispatched for t in mr.troops)
-        result["failed_troops"] = [t.index for t in mr.troops
-                                   if not t.dispatched]
-        finished = result.get("returned", not wait_return)
-        result["ok"] = bool(dispatched and result["home"] and finished)
-        if not result["ok"]:
-            if not dispatched:
-                result["reason"] = "not-dispatched"
-            elif wait_return and not finished:
-                result["reason"] = "battle-not-finished"
-            else:
-                result["reason"] = "return-home-failed"
-        return result

@@ -24,6 +24,7 @@
 """
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
 
@@ -36,8 +37,15 @@ from .adb import Adb
 from .mapnav import MapNav
 from .timing import STAGE_MOBILIZE
 
-# 状态文字规范化：OCR 会把同一行邻卡文字/倒计时粘在一起
-_STATUS_RE = re.compile(r"(空闲|停留|行军|调动|驻守|出征)(?:\D{0,2}(\d{1,2}:\d{2}:\d{2}))?")
+# 状态文字规范化：OCR 会把同一行邻卡文字/倒计时粘在一起。
+# 「队列」= 勾了「指令队列」后卡片显示的下发态（在排队/等前一条指令），
+# 必须算「非空闲」，否则会被当成没派出去而重复点出征。
+_STATUS_RE = re.compile(
+    r"(空闲|停留|行军|调动|驻守|出征|队列)(?:\D{0,2}(\d{1,2}:\d{2}:\d{2}))?")
+
+# 「指令队列」模式：勾上后面板不会随出征收起，可一次性派完 1~4 队。
+# 关掉用环境变量 SANMOU_QUEUE_MODE=0（老流程：每队出征后重开面板）。
+QUEUE_MODE_ENABLED = os.environ.get("SANMOU_QUEUE_MODE", "1").strip() != "0"
 
 # 卡片中心（全分辨率）
 # 竖屏实测（2026-11-22，900x1600）：5 张卡中心 x=105/277/449/620/792，
@@ -45,9 +53,12 @@ _STATUS_RE = re.compile(r"(空闲|停留|行军|调动|驻守|出征)(?:\D{0,2}(
 CARD_X = config._p({1: 115, 2: 323, 3: 539, 4: 760, 5: 960},
                    {1: 105, 2: 277, 3: 449, 4: 620, 5: 792})
 CARD_Y = config._p(700, 1320)
-# 卡片状态文字条带（避开上方「请选择出征部队」提示行 y≈592）
-# 竖屏状态小字在卡顶 y≈1255–1292（OCR 常读不出，读不到按「未知」处理）
-STATUS_BAND = config._p((0, 612, 1090, 678), (0, 1255, 900, 1292))
+# 卡片状态文字条带（避开上方「请选择出征部队」提示行）
+# 竖屏实测（2026-11-24，tools/panel_status_probe.py）：
+# 提示行「请选择出征部队」在 y≈1096，**卡面状态行（空闲/行军 00:10:15）在 y≈1167**，
+# 名字行 y≈1299、兵力行 y≈1331。旧值 1255~1292 落在名字行上，
+# 导致竖屏永远读不到状态（表现为「状态不可读 → 按已提交处理」）。
+STATUS_BAND = config._p((0, 612, 1090, 678), (0, 1145, 900, 1192))
 # 单卡状态条：整条带切块 OCR 一次要 10s+，按卡裁窄条只要 0.3s（实测）
 STATUS_CARD_WIDE = config._p(130, 80)     # 首选：cx±130（能同时读到「行军 + 倒计时」）
 STATUS_CARD_NARROW = config._p(95, 62)    # 兜底：cx±95（个别卡窄条才读得出）
@@ -106,13 +117,20 @@ REPLENISH_SKIP_HINTS = ("消耗辎重", "征兵 ", "自动", "今日已补兵")
 # 补兵后可能的确认弹窗（只认「确定/确认/立即征兵」，避免把「自动征兵」文字再点一次）
 REPLENISH_DIALOG_BOX = config._p((400, 300, 1260, 800), (250, 760, 660, 920))
 REPLENISH_CONFIRM_HINTS = ("确定", "确认", "立即征兵")
-# 「调动」面板的静态提示行：出征按钮不可用（灰色）时靠它判断面板仍然开着
-PANEL_HINT_BOX = config._p((400, 575, 1150, 610), (0, 1235, 900, 1300))
+# 「调动」面板的静态提示行：出征按钮不可用（灰色）时靠它判断面板仍然开着。
+# 竖屏实测（2026-11-24 攻城面板）：「请选择出征部队」在 y≈1055，
+# 旧值 1235~1300 落在部队卡上，导致攻城面板被判成「没打开」。
+PANEL_HINT_BOX = config._p((400, 575, 1150, 610), (0, 980, 900, 1130))
 PANEL_HINTS = ("请选择出征部队", "调动速度")
 # 面板底部整块（部队卡 + 体力/耗时 + 出征按钮）：按钮变灰时也必然可见，
 # 用它兜底判断「面板其实还开着」，避免误判成收起后又去重新找据点（很慢）。
 PANEL_BOTTOM_BOX = config._p((900, 600, 1600, 900), (0, 1230, 900, 1600))
-PANEL_BOTTOM_PAIR = ("不消耗", "耗时")
+# 「体力 200(-40)」或「体力 200(不消耗)」都算体力行
+PANEL_BOTTOM_PAIR = ("体力", "耗时")
+# 目标无效提示（攻城面板顶部）
+TARGET_INVALID_BOX = config._p((300, 120, 1300, 260), (0, 120, 900, 280))
+TARGET_INVALID_HINTS = ("没有连接地", "敌情难测", "审慎考量", "无法出征",
+                        "不可出征", "距离过远")
 # 出征确认弹窗：「部队未携带满战法，是否继续出征？」→ 点左侧「继续出征」
 # 横屏提示框居中 (608,541)；竖屏按钮行实测在 y≈845，左键 x≈366
 DISPATCH_DIALOG_BOX = config._p((420, 260, 1300, 800), (250, 760, 660, 920))
@@ -120,9 +138,15 @@ DISPATCH_DIALOG_HINTS = ("是否继续出征", "未携带满战法", "继续出�
 DISPATCH_CONTINUE_POINT = config._p((608, 541), (366, 845))
 # 顶部服务器时间（竖屏移到左上角时间行）
 SERVER_TIME_BOX = config._p((1425, 16, 1592, 64), (0, 8, 220, 46))
-# 面板关闭（横屏左上返回；竖屏实测底部左侧 3 个候选点、
-# 右下 (860,1240) 都无效，真正能收起「调动/出征」面板的是地图中央的 ✕ @(528,585)）
-PANEL_BACK = config._p((100, 25), (528, 585))
+# 面板关闭（横屏左上返回）。
+# 竖屏实测（2026-11-24）：真正能收起「调动/出征」面板的是**右侧中部的地图 ✕
+# @(843,945)**；旧值 (528,585) 落在空地上，点 10 次面板都不关，
+# 于是「面板残留 → 同盟页面打不开 → 据点列表解析 0 个」整轮空转。
+PANEL_BACK = config._p((100, 25), (843, 945))
+# 关面板的兜底点击序列（第一个是实测值，其余为同面板/旧版本位置）
+PANEL_BACK_FALLBACKS = config._p(
+    ((100, 25), (160, 40)),
+    ((843, 945), (843, 921), (843, 969), (528, 585)))
 
 RUNNING_HINTS = ("行军", "调动", "出征", "驻守")
 
@@ -265,6 +289,8 @@ class Mobilizer:
         self._last_img: Image.Image | None = None
         # 可选的阶段计时器（见 sanmou_auto/timing.py），None 时不记录
         self.timer = timer
+        # 「指令队列」是否已勾选（True → 出征后面板保持打开，可连续派兵）
+        self.queue_mode = False
 
     def _mark(self, name: str, kind: str = "执行", note: str = "",
               stage: str = STAGE_MOBILIZE) -> None:
@@ -308,6 +334,66 @@ class Mobilizer:
             vision.crop(img, self._scaled_box(img, PANEL_BOTTOM_BOX)), 2.0)
         ).replace(" ", "")
         return all(h in text for h in PANEL_BOTTOM_PAIR)
+
+    # -- 「指令队列」--------------------------------------------------------
+    def queue_state(self, img: Image.Image | None = None) -> bool:
+        """读左上角「指令队列」复选框状态：True=已勾选（有绿勾），False=未勾选。
+
+        实测（900x1600）：勾选前该区域绿像素 0 个；勾选后 219 个，
+        所以只认「绿勾」，不再用白框做判断（未勾选的白框像素只有 ~11 个，
+        与地图背景混淆，反而会把已勾选判成未勾选）。
+        """
+        img = img or self.adb.screencap()
+        k = img.width / config.SCREEN[0]
+        x1, y1, x2, y2 = (max(0, round(v * k)) for v in config.QUEUE_MODE_STATE_BOX)
+        x2 = min(x2, img.width)
+        y2 = min(y2, img.height)
+        if x2 - x1 < 6 or y2 - y1 < 6:
+            return False
+        px = img.load()
+        green = 0
+        for y in range(y1, y2):
+            for x in range(x1, x2):
+                r, g, b = px[x, y]
+                if g >= 130 and g - r >= 25 and g - b >= 15:
+                    green += 1
+        return green >= config.QUEUE_MODE_GREEN_MIN
+
+    def ensure_queue_mode(self, tries: int = 2) -> bool:
+        """勾选左上角「指令队列」，让出征后面板保持打开。
+
+        实测（2026-11-24）：勾上后点「出征」不再收起面板，可以
+        「点第 1 队 → 出征 → 点第 2 队 → 出征 …」一次派完，
+        省掉每队一次「重新选中据点 / 重开面板 / 重读 4 张卡」的十几秒。
+
+        返回 True 表示本轮按指令队列模式跑（面板会保持打开）；
+        False 表示走老流程（每队出征后可能需要重开面板）。
+        """
+        if not QUEUE_MODE_ENABLED:
+            self.log("  · 指令队列模式已关闭（SANMOU_QUEUE_MODE=0），按逐队重开面板跑")
+            return False
+        if not self.panel_open():
+            self.log("  ! 出征面板不在，跳过「指令队列」勾选")
+            return False
+        if self.queue_state():
+            self.log("  ✓ 指令队列已勾选：出征后面板不收起，1~4 队可一次性派完")
+            return True
+
+        point = config.QUEUE_MODE_CHECK
+        self.log(f"  == 勾选左上角「指令队列」@{point}")
+        self.adb.tap(*point)
+        time.sleep(1.0)
+        if self.queue_state():
+            self.log("  ✓ 指令队列已勾选（出征后面板保持打开，可连续派兵）")
+            return True
+        # 读不到绿勾就不再点第二次：勾选是开关，重复点会把刚勾上的又点掉，
+        # 而且盲点第二次容易把面板点没（老流程也能跑，安全优先）。
+        if not self.panel_open():
+            self.log("  ! 点「指令队列」把面板点没了，重开面板并回退逐队出征")
+            self.open_from_camp()
+            return False
+        self.log("  ! 勾选后没读到绿勾，回退逐队出征（每队可能需重开面板）")
+        return False
 
     def open_from_camp(self, wait: float = 1.8, tries: int = 3) -> bool:
         """点「调动」打开面板；地图上没有该按钮时用 reselect 重新选中据点。
@@ -383,12 +469,18 @@ class Mobilizer:
     def close(self) -> None:
         # 出征后可能残留「未携带满战法，是否继续出征？」弹窗，先点掉它
         self.nav.dismiss_modal()
-        # 城池/港口出征成功后 面板本来就会收起；这时再点左上角会误触地图 UI
+        # 城池/港口出征成功后 面板本来就会收起；这时再点 ✕ 会误触地图 UI
         if not self.panel_open():
             self.log("  · 调动面板已收起，无需再关")
             return
-        self.adb.tap(*PANEL_BACK)
-        time.sleep(1.0)
+        for i, point in enumerate(PANEL_BACK_FALLBACKS):
+            self.adb.tap(*point)
+            time.sleep(0.9)
+            if not self.panel_open():
+                if i:
+                    self.log(f"  · 用兜底点 {point} 关掉了调动面板")
+                return
+        self.log("  ! 连续点击都没关掉「调动」面板（下次 ensure_map 会再清）")
 
     # -- 读取 -------------------------------------------------------------
     def _read_card_status(self, img: Image.Image, idx: int) -> str:
@@ -950,6 +1042,11 @@ class Mobilizer:
             return result
         self._mark("打开调动面板", "执行")
 
+        # 勾「指令队列」：出征后面板不再收起，1~4 队一次派完（省掉逐队重开面板）
+        self.queue_mode = self.ensure_queue_mode()
+        self._mark("勾选指令队列", "准备",
+                   note="已在指令队列模式" if self.queue_mode else "老流程逐队出征")
+
         statuses = self.read_statuses()
         # 有的卡 OCR 只读到「行军」没读到倒计时，补读一次
         needs = [k for k, v in statuses.items()
@@ -966,13 +1063,16 @@ class Mobilizer:
         self._mark("读取部队卡状态", "分析")
         for idx in indexes:
             if not self.panel_open():
+                if self.queue_mode:
+                    self.log("  ! 指令队列模式下「出征」后面板仍被收起 → 回退逐队重开面板")
+                    self.queue_mode = False
                 self.log("  · 调动面板不在了（出征后会自动收起），重新打开")
                 if not self.open_from_camp():
                     self.log("  × 面板打不开，停止派兵")
                     break
             st = statuses.get(idx, "")
             in_transit = ":" in st and any(
-                k in st for k in ("行军", "出征", "调动"))
+                k in st for k in ("行军", "出征", "调动", "队列"))
             stationed = (not in_transit) and any(
                 k in st for k in ("调动", "驻守"))
             if (skip_busy and st and "空闲" not in st
@@ -1016,6 +1116,9 @@ class Mobilizer:
                 troop.strength = st0
                 troop.replenished = replenished
                 result.troops.append(troop)
+            if self.queue_mode and troop and troop.dispatched and not self.panel_open():
+                self.log("  ! 指令队列没生效（面板被收起），后续部队回退逐队重开")
+                self.queue_mode = False
 
         # 收尾核对：把「点完出征收起面板、没能回读状态」的部队再确认一次
         pending = [t for t in result.troops
