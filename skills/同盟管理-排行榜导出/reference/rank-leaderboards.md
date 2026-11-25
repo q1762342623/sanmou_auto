@@ -137,10 +137,12 @@ python scripts/probe.py --firstocc9        # 首占榜先切 9 级再抓
 ```bash
 python scripts/report.py                      # 最新批次
 python scripts/report.py --batch 20261126_000834 --level 9
+python scripts/report.py --out D:\x.html      # 覆盖输出路径
 ```
 
-输出：`screenshots/flow/rank_probe/rank_report_<批次>.html` 与 `rank_report_latest.html`
-（单文件、无外部依赖，双击即可看）。
+输出：**直接写到桌面** `桌面\排行榜导出_<批次>.html` + `桌面\排行榜导出_最新.html`
+（单文件、无外部依赖，双击即可看；pcap 与截图仍留在 `screenshots/flow/rank_probe/`）。
+桌面目录按 `%USERPROFILE%\Desktop` → `桌面` → `%OneDrive%\Desktop` 依次探测，兼容重定向。
 
 | 区块 | 内容 |
 | --- | --- |

@@ -27,7 +27,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-from report import OUT_DIR, build, dedupe, load_rows            # noqa: E402
+from report import DESKTOP, OUT_DIR, build, dedupe, load_rows   # noqa: E402
 
 PROBE = os.path.join(HERE, "probe.py")
 
@@ -145,11 +145,13 @@ def main(argv: list[str]) -> int:
         print("\n--skip-html：不生成页面")
         return 0 if not bad else 1
 
-    out = os.path.join(OUT_DIR, f"rank_report_{tag}.html")
+    # 报表直接落到**桌面**（pcap 仍留在 screenshots/flow/rank_probe）
+    out = os.path.join(DESKTOP, f"排行榜导出_{tag}.html")
     build(tag, out)
-    build(tag, os.path.join(OUT_DIR, "rank_report_latest.html"))
-    print(f"\nHTML -> {out}")
-    print(f"最新 -> {os.path.join(OUT_DIR, 'rank_report_latest.html')}")
+    latest = os.path.join(DESKTOP, "排行榜导出_最新.html")
+    build(tag, latest)
+    print(f"\n桌面报表 -> {out}")
+    print(f"最新       -> {latest}")
     if bad:
         print(f"\n[注意] 以下数据不足，页面已按现有数据生成：{'、'.join(bad)}")
         return 1

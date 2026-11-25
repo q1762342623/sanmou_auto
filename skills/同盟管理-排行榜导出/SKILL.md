@@ -23,7 +23,7 @@ adb 截图/触控 ─┐
         ↓  scripts/pcap_codec.py（2 字节长度帧 + XOR 随机 key + sproto）
    scan_rows()：每页 50 行 → 繁荣/武勋 300、首占 100、阵营内 ~550
         ↓  scripts/collect.py（人数硬校验，不达标只重抓该榜）
-   screenshots/flow/rank_probe/rank_report_<批次>.html + rank_report_latest.html
+   桌面\排行榜导出_<批次>.html（外加 排行榜导出_最新.html）
 ```
 
 数据**全部来自网络包**；截图/OCR 只用于导航（网格是否展开、下拉选项定位）。
@@ -38,10 +38,13 @@ adb 截图/触控 ─┐
 | `python scripts/probe.py --only 个人繁荣榜` | 只抓一个榜（`--only a,b` 抓多个） |
 | `python scripts/probe.py --firstocc9` | 首占榜先切到 9 级再抓 |
 | `python scripts/probe.py --extra` | 额外抓「阵营内排行」（讨逆军 / 太平道 各一段） |
-| `python scripts/report.py` | 用最新批次重新生成 HTML |
+| `python scripts/report.py` | 用最新批次重新生成 HTML（输出到桌面） |
 | `python scripts/report.py --batch 20261126_011931` | 指定批次生成 |
+| `python scripts/report.py --out D:\x.html` | 覆盖输出路径（默认桌面） |
 
-产物目录：`screenshots/flow/rank_probe/`（pcap + 每榜截图 + HTML）。
+产物：
+- pcap + 每榜截图留在 `screenshots/flow/rank_probe/`；
+- **HTML 直接落到桌面**：`桌面\排行榜导出_<批次>.html`，并同步一份 `桌面\排行榜导出_最新.html`。
 
 ## 1. 前置检查（每次开工做一次）
 

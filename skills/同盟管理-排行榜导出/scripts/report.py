@@ -40,6 +40,20 @@ if ROOT not in sys.path:
 from probe import (CAMP_NAMES, OUT_DIR, decode_with_opcode,    # noqa: E402
                    discover_key, iter_frames, scan_rows)
 
+
+def desktop_dir() -> str:
+    """报表落地目录：直接放**桌面**（兼容 OneDrive 重定向 / 中文「桌面」名）。"""
+    home = os.path.expanduser("~")
+    for path in (os.path.join(home, "Desktop"), os.path.join(home, "桌面"),
+                 os.path.join(os.environ.get("OneDrive") or "", "Desktop"),
+                 os.path.join(os.environ.get("OneDrive") or "", "桌面")):
+        if path and os.path.isdir(path):
+            return path
+    return home
+
+
+DESKTOP = desktop_dir()
+
 BATCH_RE = re.compile(r"^rank_(\d{8}_\d{6})_(.+)\.pcap$")
 MERIT_MIN = 1_000_000          # 武勋值量级（繁荣度目前 6 位数）
 TIMESTAMP_MIN = 1_600_000_000  # 首占榜列是「占领时间」的 unix 秒
@@ -627,13 +641,14 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
 
     batch = args.batch or list_batch()[0]
-    out = args.out or os.path.join(OUT_DIR, f"rank_report_{batch}.html")
+    # 默认直接落到**桌面**；--out 可覆盖
+    out = args.out or os.path.join(DESKTOP, f"排行榜导出_{batch}.html")
     path, stats = build(batch, out, args.level)
-    latest = os.path.join(OUT_DIR, "rank_report_latest.html")
+    latest = os.path.join(DESKTOP, "排行榜导出_最新.html")
     build(batch, latest, args.level)
 
-    print(f"HTML -> {path}")
-    print(f"最新 -> {latest}")
+    print(f"桌面报表 -> {path}")
+    print(f"最新       -> {latest}")
     titles = {"prosperity": "繁荣榜", "merit": "武勋榜", "first_occ": "首占榜"}
     for kind, value in stats.items():
         if kind == "camp":
